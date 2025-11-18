@@ -152,7 +152,8 @@ async def onboarding_ntrp(message: Message, state: FSMContext):
     raw = message.text.strip().replace(",", ".")
     try:
         ntrp = float(raw)
-    except:await message.answer("Нужно число, например 2.5 или 4.0 🙂")
+    except:
+        await message.answer("Нужно число, например 2.5 или 4.0 🙂")
         return
 
     await state.update_data(ntrp=ntrp)
@@ -242,3 +243,4 @@ async def main():
 
 if name == "__main__":
     asyncio.run(main())
+
