@@ -1,18 +1,24 @@
 import os
-import logging
 import asyncio
-from typing import Optional
+import logging
 
 import aiosqlite
-from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart, Command
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
 
-# -------------------------------------------------
+
+# -----------------------------------------
 # Настройки
-# -------------------------------------------------
+# -----------------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -20,267 +26,290 @@ if not BOT_TOKEN:
 
 DB_PATH = "tennis.db"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 
-# -------------------------------------------------
-# FSM для онбординга
-# -------------------------------------------------
+# -----------------------------------------
+# FSM анкеты
+# -----------------------------------------
 
 class Onboarding(StatesGroup):
     name = State()
     gender = State()
+    city = State()
     ntrp = State()
     about = State()
 
 
-# -------------------------------------------------
-# Тексты для NTRP
-# -------------------------------------------------
+# -----------------------------------------
+# Клавиатуры
+# -----------------------------------------
 
-NTRP_DESCRIPTION = (
-    "Шкала NTRP (1.0–7.0):\n\n"
-    "1.0–1.5 — только начинаю, учусь стабильно попадать по мячу.\n"
-    "2.0–2.5 — умею держать розыгрыш с партнёром, иногда задаю направление.\n"
-    "3.0–3.5 — могу контролировать длину и направление, есть базовая тактика.\n"
-    "4.0–4.5 — уверенные удары справа/слева, умею менять темп и глубину.\n"
-    "5.0+ — сильный игрок, стабильная техника, опыт турниров.\n"
+gender_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Мужской"), KeyboardButton(text="Женский")],
+        [KeyboardButton(text="Не указывать")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+city_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Москва")],
+        [KeyboardButton(text="Другой город"), KeyboardButton(text="Пропустить")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+ntrp_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="1.0"), KeyboardButton(text="1.5"), KeyboardButton(text="2.0")],
+        [KeyboardButton(text="2.5"), KeyboardButton(text="3.0"), KeyboardButton(text="3.5")],
+        [KeyboardButton(text="4.0"), KeyboardButton(text="4.5"), KeyboardButton(text="5.0")],
+        [KeyboardButton(text="5.5"), KeyboardButton(text="6.0"), KeyboardButton(text="6.5")],
+        [KeyboardButton(text="7.0"), KeyboardButton(text="Другое значение")],
+    ],
+    resize_keyboard=True
+)
+
+skip_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Пропустить")]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
 )
 
 
-# -------------------------------------------------
-# Работа с базой (SQLite + aiosqlite)
-# -------------------------------------------------
+# -----------------------------------------
+# База данных
+# -----------------------------------------
 
 async def init_db():
-    """Создаём таблицу, если её ещё нет."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
-                username    TEXT,
-                name        TEXT,
-                gender      TEXT,
-                ntrp        REAL,
-                about       TEXT,
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                username TEXT,
+                name TEXT,
+                gender TEXT,
+                city TEXT,
+                ntrp REAL,
+                about TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-            """
-        )
+        """)
         await db.commit()
 
 
-async def get_user(tg_id: int) -> Optional[aiosqlite.Row]:
-    """Вернуть пользователя по telegram_id или None."""
+async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM users WHERE telegram_id = ?",
-            (tg_id,),
+            (tg_id,)
         )
         row = await cursor.fetchone()
         await cursor.close()
         return row
 
 
-async def upsert_user(
-    tg_id: int,
-    username: Optional[str],
-    name: str,
-    gender: Optional[str],
-    ntrp: float,
-    about: Optional[str],
-) -> None:
-    """Создать или обновить пользователя."""
+async def upsert_user(tg_id, username, name, gender, city, ntrp, about):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO users (telegram_id, username, name, gender, ntrp, about)
-            VALUES (?, ?, ?, ?, ?, ?)
+        await db.execute("""
+            INSERT INTO users (telegram_id, username, name, gender, city, ntrp, about)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
-                username = excluded.username,
-                name     = excluded.name,
-                gender   = excluded.gender,
-                ntrp     = excluded.ntrp,
-                about    = excluded.about;
-            """,
-            (tg_id, username, name, gender, ntrp, about),
-        )
+                username=excluded.username,
+                name=excluded.name,
+                gender=excluded.gender,
+                city=excluded.city,
+                ntrp=excluded.ntrp,
+                about=excluded.about
+        """, (tg_id, username, name, gender, city, ntrp, about))
         await db.commit()
 
 
-# -------------------------------------------------
-# Хендлеры
-# -------------------------------------------------
+# -----------------------------------------
+# Анкета
+# -----------------------------------------
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    tg_id = message.from_user.id
-    user = await get_user(tg_id)
+async def start_cmd(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
 
-    # Пользователь уже есть — не гоняем по анкете второй раз
     if user:
         await state.clear()
         await message.answer(
             "Привет 👋\n"
-            "Я тебя уже знаю. Можешь посмотреть свой профиль командой /me 🎾"
+            "Ты уже прошёл анкету.\n""Посмотреть профиль → /me"
         )
         return
 
-    # Новый пользователь — запускаем онбординг
     await message.answer(
-        "Привет 👋\n"
-        "Я теннис-бот. Помогаю находить соперников и вести рейтинг NTRP.\n\n""Давай познакомимся — это займёт минуту.\n\n"
-        "Как тебя подписывать? (имя или ник)"
+        "Привет 👋\nМеня зовут TennisBot.\n"
+        "Сейчас я за минуту помогу настроить твой профиль.\n\n"
+        "Как тебя подписывать?",
+        reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(Onboarding.name)
 
 
 @dp.message(Onboarding.name)
-async def onboarding_name(message: Message, state: FSMContext):
+async def get_name(message: Message, state: FSMContext):
     name = message.text.strip()
-    if not name:
-        await message.answer("Нужно что-то написать 🙂 Попробуй ещё раз.")
-        return
-
     await state.update_data(name=name)
 
-    await message.answer(
-        "Принято 👍\n\n"
-        "Какой у тебя пол?\n"
-        "Напиши: <b>мужской</b>, <b>женский</b> или <b>не указывать</b>.",
-        parse_mode="HTML",
-    )
+    await message.answer("Выбери пол:", reply_markup=gender_kb)
     await state.set_state(Onboarding.gender)
 
 
 @dp.message(Onboarding.gender)
-async def onboarding_gender(message: Message, state: FSMContext):
-    raw = message.text.strip().lower()
-
-    if raw in ("мужской", "м", "male"):
+async def get_gender(message: Message, state: FSMContext):
+    gender_raw = message.text.lower()
+    if gender_raw.startswith("муж"):
         gender = "male"
-    elif raw in ("женский", "ж", "female"):
+    elif gender_raw.startswith("жен"):
         gender = "female"
-    elif raw in ("не указывать", "не скажу", "нет"):
+    elif gender_raw.startswith("не"):
         gender = None
     else:
-        # Если ввели что-то странное — не ругаемся, просто ставим other
         gender = "other"
 
     await state.update_data(gender=gender)
 
     await message.answer(
-        "Теперь про уровень игры 🎾\n\n"
-        + NTRP_DESCRIPTION
-        + "\n\nВведи своё число по шкале NTRP (например: 2.5 или 4.0)."
+        "В каком городе ты играешь?\nПока только Москва 😊",
+        reply_markup=city_kb
+    )
+    await state.set_state(Onboarding.city)
+
+
+@dp.message(Onboarding.city)
+async def get_city(message: Message, state: FSMContext):
+    raw = message.text.lower()
+
+    if raw.startswith("моск"):
+        city = "Москва"
+    elif raw.startswith("друг"):
+        city = "Другой город"
+    elif raw.startswith("пропус"):
+        city = None
+    else:
+        city = message.text
+
+    await state.update_data(city=city)
+
+    await message.answer(
+        "Оцени свой уровень по шкале NTRP:",
+        reply_markup=ntrp_kb
     )
     await state.set_state(Onboarding.ntrp)
 
 
 @dp.message(Onboarding.ntrp)
-async def onboarding_ntrp(message: Message, state: FSMContext):
-    raw = message.text.strip().replace(",", ".")
+async def get_ntrp(message: Message, state: FSMContext):
+    raw = message.text.replace(",", ".").strip()
+
+    if raw.lower().startswith("другое"):
+        await message.answer("Введи число, например: 3.0 или 4.5")
+        return
+
     try:
         ntrp = float(raw)
     except ValueError:
-        await message.answer("Нужно число, например 2.5 или 4.0 🙂")
-        return
-
-    # Лёгкая валидация диапазона
-    if not (1.0 <= ntrp <= 7.0):
-        await message.answer("Шкала NTRP от 1.0 до 7.0. Попробуй ещё раз 🙂")
+        await message.answer("Это не похоже на число 🤔 Попробуй ещё раз.")
         return
 
     await state.update_data(ntrp=ntrp)
 
     await message.answer(
-        "Супер 🙌\n"
-        "Последний вопрос — расскажи чуть-чуть о себе.\n\n"
-        "Например: как давно играешь, какие корты удобны, когда обычно можешь.\n"
-        "Если не хочешь писать, просто отправь «пропустить»."
+        "Напиши немного о себе или нажми «Пропустить»",
+        reply_markup=skip_kb
     )
     await state.set_state(Onboarding.about)
 
 
 @dp.message(Onboarding.about)
-async def onboarding_about(message: Message, state: FSMContext):
-    about_raw = message.text.strip()
-    if about_raw.lower() in ("пропустить", "skip"):
+async def get_about(message: Message, state: FSMContext):
+    about = message.text
+    if about.lower().startswith("пропус"):
         about = None
-    else:
-        about = about_raw
 
     data = await state.get_data()
     await state.clear()
 
-    tg_id = message.from_user.id
-    username = message.from_user.username
-
     await upsert_user(
-        tg_id=tg_id,
-        username=username,
+        tg_id=message.from_user.id,
+        username=message.from_user.username,
         name=data["name"],
         gender=data["gender"],
+        city=data["city"],
         ntrp=data["ntrp"],
         about=about,
     )
 
-    await message.answer(
-        "Готово, анкета сохранена 🎾\n\n"
-        "Посмотреть свой профиль можно командой /me.\n"
-        "Позже здесь появится поиск соперников и матчи."
-    )
+    await message.answer("Профиль сохранён! 🎾\nПосмотреть → /me")
 
 
-@dp.message(Command("me"))
-async def cmd_me(message: Message):
+# -----------------------------------------
+# Профиль
+# -----------------------------------------
+
+@dp.message(F.text == "/me")
+async def profile_cmd(message: Message):
     user = await get_user(message.from_user.id)
 
     if not user:
-        await message.answer(
-            "Похоже, ты ещё не проходил анкету.\n"
-            "Напиши /start — познакомимся 🙂"
-        )
+        await message.answer("Ты ещё не проходил анкету. Жми /start")
         return
 
-    gender_map = {
-        None: "не указан",
-        "male": "мужской",
-        "female": "женский",
-        "other": "другое",
-    }
-    gender_text = gender_map.get(user["gender"], "не указан")
-
-    about = user["about"] or "—"
-
-    text = (
+    txt = (
         "📋 <b>Твой профиль</b>\n\n"
         f"Имя: {user['name']}\n"
-        f"Пол: {gender_text}\n"
+        f"Пол: {user['gender'] or 'не указан'}\n"
+        f"Город: {user['city'] or 'не указан'}\n"
         f"NTRP: {user['ntrp']}\n"
-        f"О себе: {about}"
+        f"О себе: {user['about'] or '—'}"
     )
 
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(txt, parse_mode="HTML")
 
 
-# -------------------------------------------------
-# Точка входа
-# -------------------------------------------------
+# -----------------------------------------
+# HTTP сервер, чтобы Render не ругался
+# -----------------------------------------
+
+async def handle_root(request):
+    return web.Response(text="OK")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    port = int(os.getenv("PORT", 8000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    # держим сервер
+    while True:
+        await asyncio.sleep(3600)
+
+
+# -----------------------------------------
+# MAIN
+# -----------------------------------------
 
 async def main():
     await init_db()
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_web()
+    )
 
-
-if __name__ == "__main__":
+if name == "__main__":
     asyncio.run(main())
-
