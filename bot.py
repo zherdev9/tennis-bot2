@@ -607,13 +607,13 @@ async def profile_cmd(message: Message):
 
     if home_courts:
         lines.append("")
-        lines.append(" Домашние корты:")
+        lines.append("Домашние корты:")
         for row in home_courts:
             addr = row["address"] or "Адрес не указан"
             lines.append(f"• {row['short_name']} — <i>📍 {addr}</i>")
     else:
         lines.append("")
-        lines.append("📍 Домашние корты: не выбраны")
+        lines.append("Домашние корты: не выбраны")
 
     txt = "\n".join(lines)
 
