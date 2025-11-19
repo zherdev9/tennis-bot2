@@ -32,7 +32,9 @@ DB_PATH = "tennis.db"
 ADMIN_CHAT_ID = 199804073
 
 MIN_AGE = 18
-MAX_AGE = 90
+# Верхнюю границу явно не показываем как ограничение сервиса,
+# но отсеиваем совсем нереалистичные даты > 100 лет
+MAX_REALISTIC_AGE = 100
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -628,9 +630,6 @@ async def profile_cmd(message: Message):
         f"Город: {user['city'] or 'не указан'}",
         f"Рейтинг NTRP: {user['ntrp'] or '—'}",
         f"Опыт игры: {user['play_experience'] or '—'}",
-        f"Матчей за 6 мес: {user['matches_6m'] or '—'}",
-        f"Физподготовка: {user['fitness'] or '—'}",
-        f"Турниры: {user['tournaments'] or '—'}",
         f"Дата рождения: {user['birth_date'] or '—'}",
         f"О себе: {user['about'] or '—'}",
     ]
@@ -851,10 +850,24 @@ async def edit_birth_date(message: Message, state: FSMContext):
         return
 
     age = calculate_age_from_str(text)
-    if age is None or age < MIN_AGE or age > MAX_AGE:
+    if age is None:
         await message.answer(
-            f"Этот сервис доступен только пользователям от {MIN_AGE} до {MAX_AGE} лет.\n"
-            "Проверь дату рождения и введи ещё раз.",
+            "Не получилось обработать дату рождения.\n"
+            "Проверь формат и попробуй ещё раз."
+        )
+        return
+
+    if age < MIN_AGE:
+        await message.answer(
+            "Наш сервис доступен только для лиц, достигших 18-летнего возраста.\n"
+            "Проверь дату рождения и введи её ещё раз."
+        )
+        return
+
+    if age > MAX_REALISTIC_AGE:
+        await message.answer(
+            "Выглядит так, что дата не настоящая.\n"
+            "Проверь дату рождения и введи её ещё раз."
         )
         return
 
@@ -1364,10 +1377,24 @@ async def get_birth_date(message: Message, state: FSMContext):
         return
 
     age = calculate_age_from_str(text)
-    if age is None or age < MIN_AGE or age > MAX_AGE:
+    if age is None:
         await message.answer(
-            f"Этот сервис доступен только пользователям от {MIN_AGE} до {MAX_AGE} лет.\n"
-            "Проверь дату рождения и введи ещё раз.",
+            "Не получилось обработать дату рождения.\n"
+            "Проверь формат и попробуй ещё раз."
+        )
+        return
+
+    if age < MIN_AGE:
+        await message.answer(
+            "Наш сервис доступен только для лиц, достигших 18-летнего возраста.\n"
+            "Проверь дату рождения и введи её ещё раз."
+        )
+        return
+
+    if age > MAX_REALISTIC_AGE:
+        await message.answer(
+            "Выглядит так, что дата не настоящая.\n"
+            "Проверь дату рождения и введи её ещё раз."
         )
         return
 
