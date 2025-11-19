@@ -34,8 +34,8 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # -----------------------------------------
-# Заглушка: стартовый список кортов Москвы
-# (админ может потом добавлять свои записи в таблицу courts через SQL)
+# Стартовый список кортов Москвы
+# (админ потом может добавлять новые записи в courts через SQL)
 # -----------------------------------------
 
 COURTS_SEED = [
@@ -55,6 +55,9 @@ COURTS_SEED = [
     ("lawn_tennis_club", "Lawn Tennis", "Lawn Tennis Club", "Москва, Котляковская ул., 3с1", "Варшавская"),
     ("sk_champion_medvedkovo", "Чемпион", "СК «Чемпион»", "Москва, Олонецкий пр., 5к1А", "Медведково"),
 ]
+
+HOME_DONE = "Готово ✅"
+HOME_SKIP = "Пропустить"
 
 # -----------------------------------------
 # FSM анкеты
@@ -96,7 +99,6 @@ city_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-# Кнопки NTRP с короткими, но содержательными описаниями
 ntrp_kb = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -177,9 +179,6 @@ skip_about_kb = ReplyKeyboardMarkup(
 )
 
 def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
-    """
-    Строим клавиатуру для выбора домашних кортов из таблицы courts.
-    """
     buttons: List[List[KeyboardButton]] = []
     row: List[KeyboardButton] = []
 
@@ -192,7 +191,7 @@ def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
         buttons.append(row)
 
     buttons.append(
-        [KeyboardButton(text="Готово ✅"), KeyboardButton(text="Пропустить")]
+        [KeyboardButton(text=HOME_DONE), KeyboardButton(text=HOME_SKIP)]
     )
 
     return ReplyKeyboardMarkup(
@@ -216,8 +215,8 @@ async def init_db():
                 name TEXT,
                 gender TEXT,
                 city TEXT,
-                ntrp REAL,          -- текущий рейтинг
-                ntrp_self REAL,     -- самооценка
+                ntrp REAL,
+                ntrp_self REAL,
                 play_experience TEXT,
                 matches_6m TEXT,
                 fitness TEXT,
@@ -246,7 +245,7 @@ async def init_db():
             """
         )
 
-        # связь пользователь ↔ домашние корты
+        # user_home_courts
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_home_courts (
@@ -312,7 +311,7 @@ async def get_active_courts() -> List[aiosqlite.Row]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, short_name FROM courts WHERE is_active = 1 ORDER BY short_name;"
+            "SELECT id, short_name, address FROM courts WHERE is_active = 1 ORDER BY short_name;"
         )
         rows = await cursor.fetchall()
         await cursor.close()
@@ -410,25 +409,16 @@ async def upsert_user(
 # -----------------------------------------
 
 def parse_ntrp_from_button(text: str) -> Optional[float]:
-    """
-    Парсим NTRP из текста кнопки.
-    Ожидаем форматы типа:
-      '3.0 — ...'
-      '6.0–7.0 — ...' -> берём 6.0
-    """
     if not text:
         return None
-
-    head = text.split("—", 1)[0].strip()  # до длинного тире
+    head = text.split("—", 1)[0].strip()
     head = head.replace(" ", "")
-
     if "–" in head:
         part = head.split("–", 1)[0]
     elif "-" in head:
         part = head.split("-", 1)[0]
     else:
         part = head
-
     part = part.replace(",", ".")
     try:
         return float(part)
@@ -437,9 +427,6 @@ def parse_ntrp_from_button(text: str) -> Optional[float]:
 
 
 def normalize_custom_ntrp(value: float) -> float:
-    """
-    Ограничиваем [1.0; 7.0] и округляем до двух знаков.
-    """
     if value < 1.0:
         value = 1.0
     if value > 7.0:
@@ -454,18 +441,13 @@ def compute_final_ntrp(
     fitness: Optional[str],
     tournaments: Optional[str],
 ) -> float:
-    """
-    Новая модель с меньшими модификаторами:
-    - максимум реальный прирост ≈ +0.75
-    - без жёсткого обрезания сверху, всё зашито в коэффициенты.
-    """
     mod = 0.0
     pe = (play_experience or "").lower()
     m6 = (matches_6m or "").lower()
     fit = (fitness or "").lower()
     tour = (tournaments or "").lower()
 
-    # 1. Как давно играл в большой теннис?
+    # Как давно играл
     if "никогда" in pe:
         mod -= 0.25
     elif "в этом году" in pe:
@@ -475,7 +457,7 @@ def compute_final_ntrp(
     elif "более пяти" in pe:
         mod -= 0.15
 
-    # 2. Матчи за 6 месяцев
+    # Матчи за 6 месяцев
     if "0–10" in m6 or "0-10" in m6:
         mod += 0.0
     elif "10–100" in m6 or "10-100" in m6:
@@ -483,7 +465,7 @@ def compute_final_ntrp(
     elif "100" in m6:
         mod += 0.25
 
-    # 3. Физподготовка
+    # Физподготовка
     if "низкая" in fit:
         mod -= 0.15
     elif "хорошая" in fit:
@@ -491,7 +473,7 @@ def compute_final_ntrp(
     elif "отличная" in fit:
         mod += 0.10
 
-    # 4. Турниры
+    # Турниры
     if "tour" in tour:
         mod += 0.15
     elif "masters" in tour:
@@ -605,7 +587,6 @@ async def get_city(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     data = await state.get_data()
 
-    # если до этого просили "Другой город" — берём любой текст
     if text == "Москва":
         city = "Москва"
         manual = False
@@ -617,13 +598,11 @@ async def get_city(message: Message, state: FSMContext):
         )
         return
     else:
-        # если уже ожидали ручной город или просто приняли текст
         city = text
         manual = data.get("city_manual", False)
 
     await state.update_data(city=city, city_manual=manual)
 
-    # Переходим к выбору домашних кортов
     courts = await get_active_courts()
     if not courts:
         await message.answer(
@@ -632,7 +611,6 @@ async def get_city(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.update_data(home_courts=[])
-        # Теперь NTRP
         await message.answer(
             "Теперь давай оценим твой уровень по шкале NTRP.",
             reply_markup=ntrp_kb,
@@ -656,7 +634,8 @@ async def home_courts_handler(message: Message, state: FSMContext):
     data = await state.get_data()
     selected_ids: List[int] = data.get("home_courts", []) or []
 
-    if text == "Пропустить":
+    # Пропустить
+    if text == HOME_SKIP:
         await state.update_data(home_courts=[])
         await message.answer(
             "Окей, пока без домашних кортов.\n\n"
@@ -666,21 +645,36 @@ async def home_courts_handler(message: Message, state: FSMContext):
         await state.set_state(Onboarding.ntrp)
         return
 
-    if text == "Готово ✅":
+    # Готово
+    if text == HOME_DONE:
+        courts = await get_active_courts()
+        id_to_name = {c["id"]: c["short_name"] for c in courts}
+        if selected_ids:
+            chosen_names = [id_to_name.get(cid, str(cid)) for cid in selected_ids]
+            summary = "Твои домашние корты: " + ", ".join(chosen_names)
+        else:
+            summary = "Ты не выбрал ни одного домашнего корта."
+
         await message.answer(
-            "Отлично, двигаемся дальше.\n\n"
+            summary,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await message.answer(
             "Теперь давай оценим твой уровень по шкале NTRP.",
             reply_markup=ntrp_kb,
         )
         await state.set_state(Onboarding.ntrp)
         return
 
+    # Обычный корт
     courts = await get_active_courts()
     name_to_id = {c["short_name"]: c["id"] for c in courts}
+    name_to_addr = {c["short_name"]: c["address"] for c in courts}
 
     if text not in name_to_id:
         await message.answer(
-            "Пожалуйста, выбери корт из списка или нажми «Готово ✅» / «Пропустить»."
+            "Пожалуйста, выбери корт из списка или нажми «Готово ✅» / «Пропустить».",
+            reply_markup=build_home_courts_kb(courts),
         )
         return
 
@@ -693,16 +687,30 @@ async def home_courts_handler(message: Message, state: FSMContext):
         action = "добавил"
 
     await state.update_data(home_courts=selected_ids)
+
+    # Список выбранных кортов по именам
+    id_to_name = {c["id"]: c["short_name"] for c in courts}
+    if selected_ids:
+        chosen_names = [id_to_name.get(x, str(x)) for x in selected_ids]
+        selected_str = "Сейчас выбрано: " + ", ".join(chosen_names)
+    else:
+        selected_str = "Сейчас ничего не выбрано."
+
+    address = name_to_addr.get(text) or "Адрес не указан"
+
     await message.answer(
         f"Я {action} «{text}» в список домашних кортов.\n"
-        "Можешь выбрать ещё или нажать «Готово ✅», когда закончишь.",
+        f"<i>Адрес: {address}</i>\n\n"
+        f"{selected_str}\n\n"
+        f"Можешь выбрать ещё или нажать «{HOME_DONE}», когда закончишь.",
+        reply_markup=build_home_courts_kb(courts),
+        parse_mode="HTML",
     )
 
 
 @dp.message(Onboarding.ntrp)
 async def get_ntrp(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-
     data = await state.get_data()
     waiting_custom = data.get("waiting_custom_ntrp", False)
 
@@ -917,7 +925,6 @@ async def get_photo(message: Message, state: FSMContext):
         photo_file_id=photo_file_id,
     )
 
-    # сохраняем домашние корты
     home_courts_ids: List[int] = data.get("home_courts", []) or []
     await save_user_home_courts(message.from_user.id, home_courts_ids)
 
