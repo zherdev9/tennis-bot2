@@ -27,6 +27,10 @@ if not BOT_TOKEN:
 
 DB_PATH = "tennis.db"
 
+# ID админа, куда будут прилетать обращения по /help
+# (если захочешь вынести в ENV, можно заменить на os.getenv("ADMIN_CHAT_ID"))
+ADMIN_CHAT_ID = 199804073
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -60,7 +64,7 @@ HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
 
 # -----------------------------------------
-# FSM анкеты и редактирования
+# FSM анкеты, редактирования, поддержки
 # -----------------------------------------
 
 class Onboarding(StatesGroup):
@@ -83,6 +87,10 @@ class EditProfile(StatesGroup):
     city = State()
     about = State()
     photo = State()
+
+
+class HelpState(StatesGroup):
+    waiting_text = State()
 
 # -----------------------------------------
 # Клавиатуры
@@ -545,7 +553,7 @@ def compute_final_ntrp(
     return round(final, 2)
 
 # -----------------------------------------
-# Хэндлеры: старт, профиль, reset, edit
+# Хэндлеры: старт, профиль, reset, edit, help
 # -----------------------------------------
 
 @dp.message(CommandStart())
@@ -559,7 +567,8 @@ async def start_cmd(message: Message, state: FSMContext):
             "Ты уже проходил анкету.\n\n"
             "Посмотреть профиль → /me\n"
             "Изменить профиль → /edit\n"
-            "Сбросить и пройти заново → /reset",
+            "Сбросить и пройти заново → /reset\n"
+            "Написать в поддержку → /help",
         )
         return
 
@@ -580,7 +589,6 @@ async def profile_cmd(message: Message):
         await message.answer("Ты ещё не проходил анкету. Жми /start")
         return
 
-    # Домашние корты
     home_courts = await get_user_home_courts(message.from_user.id)
 
     lines = [
@@ -602,7 +610,7 @@ async def profile_cmd(message: Message):
         lines.append("📍 Домашние корты:")
         for row in home_courts:
             addr = row["address"] or "Адрес не указан"
-            lines.append(f"• {row['short_name']} — {addr}")
+            lines.append(f"• {row['short_name']} — <i>📍 {addr}</i>")
     else:
         lines.append("")
         lines.append("📍 Домашние корты: не выбраны")
@@ -621,12 +629,11 @@ async def profile_cmd(message: Message):
 
 @dp.message(F.text == "/reset")
 async def reset_cmd(message: Message, state: FSMContext):
-    # Сброс состояния и удаления данных
     await state.clear()
     await delete_user(message.from_user.id)
     await message.answer(
         "Я сбросил твою анкету и данные профиля.\n\n"
-        "Теперь можно пройти все заново — жми /start 🙂",
+        "Теперь можно пройти всё заново — жми /start 🙂",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -685,6 +692,7 @@ async def edit_choose_field(message: Message, state: FSMContext):
             reply_markup=edit_menu_kb,
         )
 
+
 @dp.message(EditProfile.city)
 async def edit_city(message: Message, state: FSMContext):
     city = (message.text or "").strip()
@@ -705,6 +713,7 @@ async def edit_city(message: Message, state: FSMContext):
         "Посмотреть профиль → /me",
         reply_markup=ReplyKeyboardRemove(),
     )
+
 
 @dp.message(EditProfile.about)
 async def edit_about(message: Message, state: FSMContext):
@@ -729,6 +738,7 @@ async def edit_about(message: Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove(),
     )
 
+
 @dp.message(EditProfile.photo)
 async def edit_photo(message: Message, state: FSMContext):
     if message.text and message.text.strip().lower().startswith("пропус"):
@@ -751,6 +761,70 @@ async def edit_photo(message: Message, state: FSMContext):
         "Фото профиля обновлено ✅\n\n"
         "Посмотреть профиль → /me",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+# ---------- Поддержка: /help ----------
+
+@dp.message(F.text == "/help")
+async def help_cmd(message: Message, state: FSMContext):
+    if not ADMIN_CHAT_ID:
+        await message.answer(
+            "Пока поддержка не настроена 🛠\n"
+            "Админ ещё не указал свой ID."
+        )
+        return
+
+    await state.clear()
+    await state.set_state(HelpState.waiting_text)
+    await message.answer(
+        "Напиши в одном сообщении, что случилось или какой вопрос.\n"
+        "Я передам это админу 🙂",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(HelpState.waiting_text)
+async def help_text_handler(message: Message, state: FSMContext):
+    if not ADMIN_CHAT_ID:
+        await state.clear()
+        await message.answer(
+            "Пока поддержка не настроена 🛠\n"
+            "Админ ещё не указал свой ID."
+        )
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Нужно написать текст обращения 🙂 Попробуй ещё раз.")
+        return
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "—"
+    full_name = message.from_user.full_name or "—"
+    user_id = message.from_user.id
+
+    admin_text = (
+        "🆘 Новое обращение в поддержку\n\n"
+        f"От: {full_name}\n"
+        f"Username: {username}\n"
+        f"Telegram ID: {user_id}\n\n"
+        f"Текст обращения:\n{text}"
+    )
+
+    try:
+        await bot.send_message(int(ADMIN_CHAT_ID), admin_text)
+    except Exception as e:
+        logger.exception("Failed to send help message to admin: %s", e)
+        await message.answer(
+            "Не получилось отправить сообщение админу 😔\n"
+            "Попробуй позже или напиши ему напрямую, если знаешь контакт."
+        )
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer(
+        "Спасибо! Я передал твоё сообщение админу 💬\n"
+        "Если нужно, он свяжется с тобой в Телеграме.",
     )
 
 # -----------------------------------------
@@ -900,7 +974,6 @@ async def home_courts_handler(message: Message, state: FSMContext):
 
     await state.update_data(home_courts=selected_ids)
 
-    # Список выбранных кортов по именам
     id_to_name = {c["id"]: c["short_name"] for c in courts}
     if selected_ids:
         chosen_names = [id_to_name.get(x, str(x)) for x in selected_ids]
@@ -912,7 +985,7 @@ async def home_courts_handler(message: Message, state: FSMContext):
 
     await message.answer(
         f"Я {action} «{text}» в список домашних кортов.\n"
-        f"<i>Адрес: {address}</i>\n\n"
+        f"<i>Адрес: 📍 {address}</i>\n\n"
         f"{selected_str}\n\n"
         f"Можешь выбрать ещё или нажать «{HOME_DONE}», когда закончишь.",
         reply_markup=build_home_courts_kb(courts),
@@ -1095,7 +1168,6 @@ async def get_about(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.photo)
 async def get_photo(message: Message, state: FSMContext):
-    # Фото или "Пропустить"
     if message.text and message.text.strip().lower().startswith("пропус"):
         photo_file_id = None
     elif message.photo:
@@ -1107,7 +1179,6 @@ async def get_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    # ntrp_self может быть строкой → приводим к float
     base_ntrp_raw = data.get("ntrp_self")
     try:
         base_ntrp = float(base_ntrp_raw) if base_ntrp_raw is not None else 3.0
@@ -1156,7 +1227,7 @@ async def get_photo(message: Message, state: FSMContext):
     )
 
 # -----------------------------------------
-# HTTP-сервер для Render
+# HTTP-сервер для Render (healthcheck)
 # -----------------------------------------
 
 async def handle_root(request):
