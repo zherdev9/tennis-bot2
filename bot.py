@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+from typing import List, Optional
 
 import aiosqlite
 from aiohttp import web
@@ -27,12 +28,14 @@ if not BOT_TOKEN:
 DB_PATH = "tennis.db"
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # -----------------------------------------
-# Заглушка: список кортов Москвы
+# Заглушка: стартовый список кортов Москвы
+# (админ может потом добавлять свои записи в таблицу courts через SQL)
 # -----------------------------------------
 
 COURTS_SEED = [
@@ -61,6 +64,7 @@ class Onboarding(StatesGroup):
     name = State()
     gender = State()
     city = State()
+    home_courts = State()
     ntrp = State()
     play_experience = State()
     matches_6m = State()
@@ -92,7 +96,7 @@ city_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-# Кнопки NTRP с короткими описаниями
+# Кнопки NTRP с короткими, но содержательными описаниями
 ntrp_kb = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -166,12 +170,36 @@ tournaments_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-# Только для вопроса "О себе"
 skip_about_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Пропустить")]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
+
+def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
+    """
+    Строим клавиатуру для выбора домашних кортов из таблицы courts.
+    """
+    buttons: List[List[KeyboardButton]] = []
+    row: List[KeyboardButton] = []
+
+    for i, court in enumerate(courts, start=1):
+        row.append(KeyboardButton(text=court["short_name"]))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append(
+        [KeyboardButton(text="Готово ✅"), KeyboardButton(text="Пропустить")]
+    )
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 # -----------------------------------------
 # База данных
@@ -179,6 +207,7 @@ skip_about_kb = ReplyKeyboardMarkup(
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # users
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -187,8 +216,8 @@ async def init_db():
                 name TEXT,
                 gender TEXT,
                 city TEXT,
-                ntrp REAL,
-                ntrp_self REAL,
+                ntrp REAL,          -- текущий рейтинг
+                ntrp_self REAL,     -- самооценка
                 play_experience TEXT,
                 matches_6m TEXT,
                 fitness TEXT,
@@ -202,6 +231,7 @@ async def init_db():
         )
         await _ensure_user_columns(db)
 
+        # courts
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS courts (
@@ -216,6 +246,7 @@ async def init_db():
             """
         )
 
+        # связь пользователь ↔ домашние корты
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_home_courts (
@@ -277,6 +308,31 @@ async def seed_courts_if_empty(db: aiosqlite.Connection):
     )
 
 
+async def get_active_courts() -> List[aiosqlite.Row]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, short_name FROM courts WHERE is_active = 1 ORDER BY short_name;"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+
+async def save_user_home_courts(telegram_id: int, court_ids: List[int]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM user_home_courts WHERE telegram_id = ?;",
+            (telegram_id,),
+        )
+        if court_ids:
+            await db.executemany(
+                "INSERT INTO user_home_courts (telegram_id, court_id) VALUES (?, ?);",
+                [(telegram_id, cid) for cid in court_ids],
+            )
+        await db.commit()
+
+
 async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -290,20 +346,20 @@ async def get_user(tg_id: int):
 
 
 async def upsert_user(
-    tg_id,
-    username,
-    name,
-    gender,
-    city,
-    ntrp,
-    ntrp_self,
-    play_experience,
-    matches_6m,
-    fitness,
-    tournaments,
-    birth_date,
-    about,
-    photo_file_id,
+    tg_id: int,
+    username: Optional[str],
+    name: Optional[str],
+    gender: Optional[str],
+    city: Optional[str],
+    ntrp: Optional[float],
+    ntrp_self: Optional[float],
+    play_experience: Optional[str],
+    matches_6m: Optional[str],
+    fitness: Optional[str],
+    tournaments: Optional[str],
+    birth_date: Optional[str],
+    about: Optional[str],
+    photo_file_id: Optional[str],
 ):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -350,10 +406,10 @@ async def upsert_user(
         await db.commit()
 
 # -----------------------------------------
-# Логика NTRP и рейтинга
+# Логика рейтинга
 # -----------------------------------------
 
-def parse_ntrp_from_button(text: str):
+def parse_ntrp_from_button(text: str) -> Optional[float]:
     """
     Парсим NTRP из текста кнопки.
     Ожидаем форматы типа:
@@ -391,11 +447,17 @@ def normalize_custom_ntrp(value: float) -> float:
     return round(value, 2)
 
 
-def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tournaments):
+def compute_final_ntrp(
+    base_ntrp: float,
+    play_experience: Optional[str],
+    matches_6m: Optional[str],
+    fitness: Optional[str],
+    tournaments: Optional[str],
+) -> float:
     """
-    Новая модель с уменьшенными модификаторами:
-    - Максимальный реальный прирост ≈ +0.75
-    - Без жёсткого "обрезания", только за счёт самих коэффициентов.
+    Новая модель с меньшими модификаторами:
+    - максимум реальный прирост ≈ +0.75
+    - без жёсткого обрезания сверху, всё зашито в коэффициенты.
     """
     mod = 0.0
     pe = (play_experience or "").lower()
@@ -403,7 +465,7 @@ def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tourname
     fit = (fitness or "").lower()
     tour = (tournaments or "").lower()
 
-    # Опыт игры в теннис
+    # 1. Как давно играл в большой теннис?
     if "никогда" in pe:
         mod -= 0.25
     elif "в этом году" in pe:
@@ -413,7 +475,7 @@ def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tourname
     elif "более пяти" in pe:
         mod -= 0.15
 
-    # Матчи за 6 месяцев
+    # 2. Матчи за 6 месяцев
     if "0–10" in m6 or "0-10" in m6:
         mod += 0.0
     elif "10–100" in m6 or "10-100" in m6:
@@ -421,7 +483,7 @@ def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tourname
     elif "100" in m6:
         mod += 0.25
 
-    # Физподготовка
+    # 3. Физподготовка
     if "низкая" in fit:
         mod -= 0.15
     elif "хорошая" in fit:
@@ -429,7 +491,7 @@ def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tourname
     elif "отличная" in fit:
         mod += 0.10
 
-    # Турнирный опыт
+    # 4. Турниры
     if "tour" in tour:
         mod += 0.15
     elif "masters" in tour:
@@ -444,7 +506,7 @@ def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tourname
     return round(final, 2)
 
 # -----------------------------------------
-# Хэндлеры онбординга
+# Хэндлеры
 # -----------------------------------------
 
 @dp.message(CommandStart())
@@ -455,7 +517,7 @@ async def start_cmd(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(
             "Привет 👋\n"
-            "Ты уже проходил анкету.\n"
+            "Ты уже проходил анкету.\n\n"
             "Посмотреть профиль → /me",
         )
         return
@@ -469,6 +531,38 @@ async def start_cmd(message: Message, state: FSMContext):
     await state.set_state(Onboarding.name)
 
 
+@dp.message(F.text == "/me")
+async def profile_cmd(message: Message):
+    user = await get_user(message.from_user.id)
+
+    if not user:
+        await message.answer("Ты ещё не проходил анкету. Жми /start")
+        return
+
+    txt = (
+        "📋 <b>Твой профиль</b>\n\n"
+        f"Имя: {user['name']}\n"
+        f"Пол: {user['gender'] or 'Не указывать'}\n"
+        f"Город: {user['city'] or 'не указан'}\n"
+        f"Рейтинг NTRP: {user['ntrp'] or '—'}\n"
+        f"Опыт игры: {user['play_experience'] or '—'}\n"
+        f"Матчей за 6 мес: {user['matches_6m'] or '—'}\n"
+        f"Физподготовка: {user['fitness'] or '—'}\n"
+        f"Турниры: {user['tournaments'] or '—'}\n"
+        f"Дата рождения: {user['birth_date'] or '—'}\n"
+        f"О себе: {user['about'] or '—'}"
+    )
+
+    if user["photo_file_id"]:
+        await message.answer_photo(
+            photo=user["photo_file_id"],
+            caption=txt,
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(txt, parse_mode="HTML")
+
+
 @dp.message(Onboarding.name)
 async def get_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
@@ -478,19 +572,19 @@ async def get_name(message: Message, state: FSMContext):
 
     await state.update_data(name=name)
 
-    await message.answer("Выбери свой пол:", reply_markup=gender_kb)
+    await message.answer("Выбери пол:", reply_markup=gender_kb)
     await state.set_state(Onboarding.gender)
 
 
 @dp.message(Onboarding.gender)
 async def get_gender(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
+    gender_raw = (message.text or "").strip().lower()
 
-    if text.startswith("муж"):
+    if gender_raw.startswith("муж"):
         gender = "Мужчина"
-    elif text.startswith("жен"):
+    elif gender_raw.startswith("жен"):
         gender = "Женщина"
-    elif text.startswith("не"):
+    elif gender_raw.startswith("не"):
         gender = "Не указывать"
     else:
         await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
@@ -509,19 +603,100 @@ async def get_gender(message: Message, state: FSMContext):
 @dp.message(Onboarding.city)
 async def get_city(message: Message, state: FSMContext):
     text = (message.text or "").strip()
+    data = await state.get_data()
 
-    if not text:
-        await message.answer("Город не может быть пустым, укажи хотя бы что-то 🙂")
+    # если до этого просили "Другой город" — берём любой текст
+    if text == "Москва":
+        city = "Москва"
+        manual = False
+    elif text == "Другой город" and not data.get("city_manual"):
+        await state.update_data(city_manual=True)
+        await message.answer(
+            "Ок, напиши, пожалуйста, свой город текстом.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    else:
+        # если уже ожидали ручной город или просто приняли текст
+        city = text
+        manual = data.get("city_manual", False)
+
+    await state.update_data(city=city, city_manual=manual)
+
+    # Переходим к выбору домашних кортов
+    courts = await get_active_courts()
+    if not courts:
+        await message.answer(
+            "Пока я не знаю теннисные корты в этом городе, пропускаем этот шаг.\n"
+            "Позже админ добавит список кортов.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.update_data(home_courts=[])
+        # Теперь NTRP
+        await message.answer(
+            "Теперь давай оценим твой уровень по шкале NTRP.",
+            reply_markup=ntrp_kb,
+        )
+        await state.set_state(Onboarding.ntrp)
         return
 
-    await state.update_data(city=text)
-
+    await state.update_data(home_courts=[])
     await message.answer(
-        "Теперь выбери свой уровень по шкале NTRP.\n\n"
-        "Кнопки ниже с короткими описаниями навыков.",
-        reply_markup=ntrp_kb,
+        "Выбери один или несколько домашних кортов.\n"
+        "Нажимай по кнопкам, чтобы добавить/убрать корт.\n"
+        "Когда закончишь, нажми «Готово ✅». Если пока неважно – «Пропустить».",
+        reply_markup=build_home_courts_kb(courts),
     )
-    await state.set_state(Onboarding.ntrp)
+    await state.set_state(Onboarding.home_courts)
+
+
+@dp.message(Onboarding.home_courts)
+async def home_courts_handler(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    selected_ids: List[int] = data.get("home_courts", []) or []
+
+    if text == "Пропустить":
+        await state.update_data(home_courts=[])
+        await message.answer(
+            "Окей, пока без домашних кортов.\n\n"
+            "Теперь давай оценим твой уровень по шкале NTRP.",
+            reply_markup=ntrp_kb,
+        )
+        await state.set_state(Onboarding.ntrp)
+        return
+
+    if text == "Готово ✅":
+        await message.answer(
+            "Отлично, двигаемся дальше.\n\n"
+            "Теперь давай оценим твой уровень по шкале NTRP.",
+            reply_markup=ntrp_kb,
+        )
+        await state.set_state(Onboarding.ntrp)
+        return
+
+    courts = await get_active_courts()
+    name_to_id = {c["short_name"]: c["id"] for c in courts}
+
+    if text not in name_to_id:
+        await message.answer(
+            "Пожалуйста, выбери корт из списка или нажми «Готово ✅» / «Пропустить»."
+        )
+        return
+
+    cid = name_to_id[text]
+    if cid in selected_ids:
+        selected_ids.remove(cid)
+        action = "убрал"
+    else:
+        selected_ids.append(cid)
+        action = "добавил"
+
+    await state.update_data(home_courts=selected_ids)
+    await message.answer(
+        f"Я {action} «{text}» в список домашних кортов.\n"
+        "Можешь выбрать ещё или нажать «Готово ✅», когда закончишь.",
+    )
 
 
 @dp.message(Onboarding.ntrp)
@@ -531,7 +706,6 @@ async def get_ntrp(message: Message, state: FSMContext):
     data = await state.get_data()
     waiting_custom = data.get("waiting_custom_ntrp", False)
 
-    # Если только что нажали кнопку "Ввести свой уровень..."
     if text.startswith("Ввести свой уровень"):
         await state.update_data(waiting_custom_ntrp=True)
         await message.answer(
@@ -541,7 +715,6 @@ async def get_ntrp(message: Message, state: FSMContext):
         )
         return
 
-    # Если ждём ручной ввод уровня
     if waiting_custom:
         raw = text.replace(",", ".")
         try:
@@ -556,7 +729,6 @@ async def get_ntrp(message: Message, state: FSMContext):
         value = normalize_custom_ntrp(value)
         await state.update_data(ntrp_self=value, waiting_custom_ntrp=False)
     else:
-        # Обычный выбор кнопки
         base_ntrp = parse_ntrp_from_button(text)
         if base_ntrp is None:
             await message.answer(
@@ -567,7 +739,7 @@ async def get_ntrp(message: Message, state: FSMContext):
         await state.update_data(ntrp_self=base_ntrp)
 
     await message.answer(
-        "Играешь ли ты в большой теннис?",
+        "Как давно ты играл в большой теннис?",
         reply_markup=play_experience_kb,
     )
     await state.set_state(Onboarding.play_experience)
@@ -695,19 +867,21 @@ async def get_about(message: Message, state: FSMContext):
 
     await message.answer(
         "Финальный штрих — добавь фото для профиля 📷\n\n"
-        "Просто отправь фото.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Просто отправь фото или нажми «Пропустить».",
+        reply_markup=skip_about_kb,
     )
     await state.set_state(Onboarding.photo)
 
 
 @dp.message(Onboarding.photo)
 async def get_photo(message: Message, state: FSMContext):
-    if not message.photo:
-        await message.answer("Пожалуйста, отправь именно фото 🙂")
+    if message.text and message.text.strip().lower().startswith("пропус"):
+        photo_file_id = None
+    elif message.photo:
+        photo_file_id = message.photo[-1].file_id
+    else:
+        await message.answer("Пожалуйста, отправь фото или нажми «Пропустить» 🙂")
         return
-
-    photo_file_id = message.photo[-1].file_id
 
     data = await state.get_data()
     await state.clear()
@@ -743,48 +917,17 @@ async def get_photo(message: Message, state: FSMContext):
         photo_file_id=photo_file_id,
     )
 
+    # сохраняем домашние корты
+    home_courts_ids: List[int] = data.get("home_courts", []) or []
+    await save_user_home_courts(message.from_user.id, home_courts_ids)
+
     await message.answer(
-        f"Профиль сохранён! 🎾\n\n"
-        f"Твоя самооценка: {base_ntrp:.2f}\n"
-        f"Начальный рейтинг в боте: {final_ntrp:.2f}\n\n"
-        f"Посмотреть профиль → /me",
+        "Профиль сохранён! 🎾\n\n"
+        f"Твой текущий рейтинг NTRP: {final_ntrp:.2f}\n\n"
+        "Он будет меняться после сыгранных матчей.\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
     )
-
-# -----------------------------------------
-# Профиль
-# -----------------------------------------
-
-@dp.message(F.text == "/me")
-async def profile_cmd(message: Message):
-    user = await get_user(message.from_user.id)
-
-    if not user:
-        await message.answer("Ты ещё не проходил анкету. Жми /start")
-        return
-
-    txt = (
-        "📋 <b>Твой профиль</b>\n\n"
-        f"Имя: {user['name']}\n"
-        f"Пол: {user['gender'] or 'Не указывать'}\n"
-        f"Город: {user['city'] or 'не указан'}\n"
-        f"Самооценка NTRP: {user['ntrp_self'] or '—'}\n"
-        f"Начальный рейтинг бота: {user['ntrp'] or '—'}\n"
-        f"Опыт игры: {user['play_experience'] or '—'}\n"
-        f"Матчей за 6 мес: {user['matches_6m'] or '—'}\n"
-        f"Физподготовка: {user['fitness'] or '—'}\n"
-        f"Турниры: {user['tournaments'] or '—'}\n"
-        f"Дата рождения: {user['birth_date'] or '—'}\n"
-        f"О себе: {user['about'] or '—'}"
-    )
-
-    if user["photo_file_id"]:
-        await message.answer_photo(
-            photo=user["photo_file_id"],
-            caption=txt,
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(txt, parse_mode="HTML")
 
 # -----------------------------------------
 # HTTP-сервер для Render
