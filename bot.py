@@ -143,7 +143,8 @@ async def get_user(tg_id: int):
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return rowasync def upsert_user(tg_id, username, name, gender, city, ntrp, about, photo_file_id):
+        return row
+        async def upsert_user(tg_id, username, name, gender, city, ntrp, about, photo_file_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (telegram_id, username, name, gender, city, ntrp, about, photo_file_id)
@@ -414,3 +415,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
