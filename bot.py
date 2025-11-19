@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional
 
 import aiosqlite
@@ -44,9 +44,10 @@ dp = Dispatcher()
 
 HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
+GAME_CANCEL = "Отмена"
 
 # -----------------------------------------
-# FSM анкеты, редактирования, поддержки
+# FSM: анкета, редактирование, поддержка, игры
 # -----------------------------------------
 
 class Onboarding(StatesGroup):
@@ -78,6 +79,16 @@ class EditProfile(StatesGroup):
 class HelpState(StatesGroup):
     waiting_text = State()
 
+
+class GameCreate(StatesGroup):
+    club = State()
+    datetime = State()
+    is_private = State()
+    court_booked = State()
+    game_type = State()
+    players_count = State()
+    rating_filter = State()
+
 # -----------------------------------------
 # Хелперы
 # -----------------------------------------
@@ -100,6 +111,16 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
         - ((today.month, today.day) < (dob.month, dob.day))
     )
     return age
+
+
+def parse_dt(text: str) -> Optional[datetime]:
+    """
+    Ожидаем формат 'ДД.ММ.ГГГГ ЧЧ:ММ'
+    """
+    try:
+        return datetime.strptime(text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        return None
 
 # -----------------------------------------
 # Клавиатуры
@@ -213,6 +234,32 @@ edit_menu_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+yes_no_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+game_type_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Тренировка")],
+        [KeyboardButton(text="Матч на рейтинг")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+players_count_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="2 игрока")],
+        [KeyboardButton(text="4 игрока")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
 def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
     buttons: List[List[KeyboardButton]] = []
     row: List[KeyboardButton] = []
@@ -235,6 +282,30 @@ def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+
+def build_club_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
+    """
+    Клавиатура выбора клуба для создания игры (одиночный выбор + отмена).
+    """
+    buttons: List[List[KeyboardButton]] = []
+    row: List[KeyboardButton] = []
+
+    for i, court in enumerate(courts, start=1):
+        row.append(KeyboardButton(text=court["short_name"]))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([KeyboardButton(text=GAME_CANCEL)])
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
 # -----------------------------------------
 # База данных
 # -----------------------------------------
@@ -246,19 +317,19 @@ async def init_db():
             """
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                name TEXT,
-                gender TEXT,
-                city TEXT,
-                ntrp REAL,
-                ntrp_self REAL,
+                username   TEXT,
+                name       TEXT,
+                gender     TEXT,
+                city       TEXT,
+                ntrp       REAL,
+                ntrp_self  REAL,
                 play_experience TEXT,
-                matches_6m TEXT,
-                fitness TEXT,
-                tournaments TEXT,
-                birth_date TEXT,
-                about TEXT,
-                photo_file_id TEXT,
+                matches_6m     TEXT,
+                fitness        TEXT,
+                tournaments    TEXT,
+                birth_date     TEXT,
+                about          TEXT,
+                photo_file_id  TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -269,13 +340,13 @@ async def init_db():
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS courts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slug TEXT UNIQUE,
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug       TEXT UNIQUE,
                 short_name TEXT NOT NULL,
-                full_name TEXT,
-                address TEXT,
-                area TEXT,
-                is_active INTEGER DEFAULT 1
+                full_name  TEXT,
+                address    TEXT,
+                area       TEXT,
+                is_active  INTEGER DEFAULT 1
             );
             """
         )
@@ -284,10 +355,41 @@ async def init_db():
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_home_courts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
-                court_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                court_id    INTEGER NOT NULL,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+        # games
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS games (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_id    INTEGER NOT NULL,
+                club_id       INTEGER NOT NULL,
+                starts_at     TEXT NOT NULL,
+                is_private    INTEGER NOT NULL DEFAULT 0,
+                court_booked  INTEGER NOT NULL DEFAULT 0,
+                game_type     TEXT NOT NULL,
+                players_count INTEGER NOT NULL,
+                rating_min    REAL,
+                rating_max    REAL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+        # game_players (на будущее, пока не используем)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_players (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id     INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                joined_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -326,8 +428,7 @@ async def _ensure_user_columns(db: aiosqlite.Connection):
 
 async def seed_courts_if_empty(db: aiosqlite.Connection):
     """
-    Если таблица courts пуста — заливаем данные из courts_seed_big.sql.
-    Если файл не найден или в нём ошибка, просто логируем и оставляем таблицу пустой.
+    Если таблица courts пустая — выполняем courts_seed_big.sql.
     """
     cursor = await db.execute("SELECT COUNT(*) FROM courts;")
     row = await cursor.fetchone()
@@ -342,11 +443,12 @@ async def seed_courts_if_empty(db: aiosqlite.Connection):
         with open(sql_path, "r", encoding="utf-8") as f:
             sql = f.read()
         await db.executescript(sql)
-        logger.info("Courts seeded from courts_seed_big.sql")
+        logger.info("Courts seeded from %s", sql_path)
     except FileNotFoundError:
-        logger.warning("courts_seed_big.sql not found, courts table left empty")
-    except Exception as e:
-        logger.exception("Failed to seed courts from courts_seed_big.sql: %s", e)
+        logger.warning(
+            "courts_seed_big.sql not found (%s). Courts table will stay empty.",
+            sql_path,
+        )
 
 
 async def get_active_courts() -> List[aiosqlite.Row]:
@@ -584,6 +686,7 @@ async def start_cmd(message: Message, state: FSMContext):
             "Посмотреть профиль → /me\n"
             "Изменить профиль → /edit\n"
             "Сбросить и пройти заново → /reset\n"
+            "Создать игру → /newgame\n"
             "Написать в поддержку → /help",
         )
         return
@@ -1053,7 +1156,320 @@ async def help_text_handler(message: Message, state: FSMContext):
     )
 
 # -----------------------------------------
-# Остальные хэндлеры онбординга
+# Создание игры /newgame
+# -----------------------------------------
+
+@dp.message(F.text == "/newgame")
+async def newgame_cmd(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "Сначала нужно заполнить профиль.\n"
+            "Жми /start и пройди анкету 🙂"
+        )
+        return
+
+    courts = await get_active_courts()
+    if not courts:
+        await message.answer(
+            "Пока нет каталога кортов. Обратись к админу."
+        )
+        return
+
+    await state.clear()
+    await state.set_state(GameCreate.club)
+    await state.update_data(game={})
+    await message.answer(
+        "Давай создадим игру 🎾\n\n"
+        "Сначала выбери клуб:",
+        reply_markup=build_club_kb(courts),
+    )
+
+
+@dp.message(GameCreate.club)
+async def game_choose_club(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == GAME_CANCEL:
+        await state.clear()
+        await message.answer(
+            "Создание игры отменено.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    courts = await get_active_courts()
+    name_to_id = {c["short_name"]: c["id"] for c in courts}
+
+    if text not in name_to_id:
+        await message.answer(
+            "Пожалуйста, выбери клуб из списка или нажми «Отмена».",
+            reply_markup=build_club_kb(courts),
+        )
+        return
+
+    game = (await state.get_data()).get("game", {})
+    game["club_id"] = name_to_id[text]
+    game["club_name"] = text
+
+    await state.update_data(game=game)
+    await state.set_state(GameCreate.datetime)
+    await message.answer(
+        "Укажи дату и время игры в формате:\n"
+        "<b>ДД.ММ.ГГГГ ЧЧ:ММ</b>\n"
+        "Например: 25.11.2025 19:30",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GameCreate.datetime)
+async def game_datetime(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    dt = parse_dt(text)
+    if not dt:
+        await message.answer(
+            "Не получилось разобрать дату и время 😅\n"
+            "Нужен формат ДД.ММ.ГГГГ ЧЧ:ММ, например: 25.11.2025 19:30"
+        )
+        return
+
+    game = (await state.get_data()).get("game", {})
+    game["starts_at"] = dt.isoformat()
+
+    await state.update_data(game=game)
+    await state.set_state(GameCreate.is_private)
+    await message.answer(
+        "Это приватная игра? (видна только по ссылке / приглашению)",
+        reply_markup=yes_no_kb,
+    )
+
+
+@dp.message(GameCreate.is_private)
+async def game_is_private(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+
+    if text.startswith("да"):
+        is_private = 1
+    elif text.startswith("нет"):
+        is_private = 0
+    else:
+        await message.answer("Выбери «Да» или «Нет» 🙂", reply_markup=yes_no_kb)
+        return
+
+    game = (await state.get_data()).get("game", {})
+    game["is_private"] = is_private
+    await state.update_data(game=game)
+
+    await state.set_state(GameCreate.court_booked)
+    await message.answer(
+        "Ты уже забронировал корт?",
+        reply_markup=yes_no_kb,
+    )
+
+
+@dp.message(GameCreate.court_booked)
+async def game_court_booked(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+
+    if text.startswith("да"):
+        court_booked = 1
+    elif text.startswith("нет"):
+        court_booked = 0
+    else:
+        await message.answer("Выбери «Да» или «Нет» 🙂", reply_markup=yes_no_kb)
+        return
+
+    game = (await state.get_data()).get("game", {})
+    game["court_booked"] = court_booked
+    await state.update_data(game=game)
+
+    await state.set_state(GameCreate.game_type)
+    await message.answer(
+        "Выбери тип игры:",
+        reply_markup=game_type_kb,
+    )
+
+
+@dp.message(GameCreate.game_type)
+async def game_type_handler(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Тренировка":
+        game_type_val = "training"
+    elif text == "Матч на рейтинг":
+        game_type_val = "rating"
+    else:
+        await message.answer(
+            "Пожалуйста, выбери тип игры с клавиатуры 🙂",
+            reply_markup=game_type_kb,
+        )
+        return
+
+    game = (await state.get_data()).get("game", {})
+    game["game_type"] = game_type_val
+    await state.update_data(game=game)
+
+    await state.set_state(GameCreate.players_count)
+    await message.answer(
+        "Сколько игроков планируется?",
+        reply_markup=players_count_kb,
+    )
+
+
+@dp.message(GameCreate.players_count)
+async def game_players_count(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text.startswith("2"):
+        players_count = 2
+    elif text.startswith("4"):
+        players_count = 4
+    else:
+        await message.answer(
+            "Выбери «2 игрока» или «4 игрока».",
+            reply_markup=players_count_kb,
+        )
+        return
+
+    data = await state.get_data()
+    game = data.get("game", {})
+    game["players_count"] = players_count
+    await state.update_data(game=game)
+
+    if game.get("game_type") == "rating":
+        await state.set_state(GameCreate.rating_filter)
+        await message.answer(
+            "Нужно ли ограничение по рейтингу?\n\n"
+            "Если да — введи диапазон в формате, например: 3.0-3.75\n"
+            "Если нет — отправь «Без ограничений».",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        # Тренировка — сохраняем без фильтра и создаём игру
+        await create_game_and_finish(message, state)
+
+
+@dp.message(GameCreate.rating_filter)
+async def game_rating_filter(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+
+    rating_min = None
+    rating_max = None
+
+    if text.startswith("без"):
+        # без ограничений
+        pass
+    else:
+        m = re.match(r"^\s*([\d.,]+)\s*-\s*([\d.,]+)\s*$", text)
+        if not m:
+            await message.answer(
+                "Не смог разобрать диапазон 🤔\n"
+                "Нужен формат вроде: 3.0-3.75 или «Без ограничений».",
+            )
+            return
+
+        try:
+            rating_min = float(m.group(1).replace(",", "."))
+            rating_max = float(m.group(2).replace(",", "."))
+        except ValueError:
+            await message.answer(
+                "Не смог распознать числа в диапазоне.\n"
+                "Попробуй ещё раз, например: 3.0-3.75",
+            )
+            return
+
+        if rating_min > rating_max:
+            rating_min, rating_max = rating_max, rating_min
+
+    data = await state.get_data()
+    game = data.get("game", {})
+    game["rating_min"] = rating_min
+    game["rating_max"] = rating_max
+    await state.update_data(game=game)
+
+    await create_game_and_finish(message, state)
+
+
+async def create_game_and_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    game = data.get("game", {})
+
+    creator_id = message.from_user.id
+    club_id = game.get("club_id")
+    starts_at = game.get("starts_at")
+    is_private = int(game.get("is_private", 0))
+    court_booked = int(game.get("court_booked", 0))
+    game_type_val = game.get("game_type", "training")
+    players_count = int(game.get("players_count", 2))
+    rating_min = game.get("rating_min")
+    rating_max = game.get("rating_max")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO games (
+                creator_id, club_id, starts_at,
+                is_private, court_booked,
+                game_type, players_count,
+                rating_min, rating_max
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                creator_id,
+                club_id,
+                starts_at,
+                is_private,
+                court_booked,
+                game_type_val,
+                players_count,
+                rating_min,
+                rating_max,
+            ),
+        )
+        await db.commit()
+        game_id = cursor.lastrowid
+
+        # Получим название клуба и адрес
+        db.row_factory = aiosqlite.Row
+        c2 = await db.execute(
+            "SELECT short_name, address FROM courts WHERE id = ?;",
+            (club_id,),
+        )
+        club_row = await c2.fetchone()
+        await c2.close()
+
+    await state.clear()
+
+    club_name = club_row["short_name"] if club_row else "Клуб"
+    address = club_row["address"] if club_row and club_row["address"] else "Адрес не указан"
+
+    dt = datetime.fromisoformat(starts_at)
+    dt_str = dt.strftime("%d.%m.%Y %H:%M")
+
+    lines = [
+        "Игра создана ✅",
+        f"ID: #{game_id}",
+        f"Клуб: {club_name}",
+        f"Адрес: {address}",
+        f"Дата и время: {dt_str}",
+        f"Тип: {'Тренировка' if game_type_val == 'training' else 'Матч на рейтинг'}",
+        f"Игроков: {players_count}",
+        f"Приватная: {'Да' if is_private else 'Нет'}",
+        f"Корт забронирован: {'Да' if court_booked else 'Нет'}",
+    ]
+
+    if game_type_val == "rating":
+        if rating_min is not None and rating_max is not None:
+            lines.append(f"Фильтр по рейтингу: {rating_min:.2f}–{rating_max:.2f}")
+        else:
+            lines.append("Фильтр по рейтингу: нет")
+
+    await message.answer("\n".join(lines))
+
+# -----------------------------------------
+# Остальные хэндлеры онбординга (как раньше)
 # -----------------------------------------
 
 @dp.message(Onboarding.name)
