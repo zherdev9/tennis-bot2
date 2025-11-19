@@ -60,7 +60,7 @@ HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
 
 # -----------------------------------------
-# FSM анкеты
+# FSM анкеты и редактирования
 # -----------------------------------------
 
 class Onboarding(StatesGroup):
@@ -74,6 +74,13 @@ class Onboarding(StatesGroup):
     fitness = State()
     tournaments = State()
     birth_date = State()
+    about = State()
+    photo = State()
+
+
+class EditProfile(StatesGroup):
+    choose_field = State()
+    city = State()
     about = State()
     photo = State()
 
@@ -174,6 +181,17 @@ tournaments_kb = ReplyKeyboardMarkup(
 
 skip_about_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Пропустить")]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+edit_menu_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Город")],
+        [KeyboardButton(text="О себе")],
+        [KeyboardButton(text="Фото")],
+        [KeyboardButton(text="Отмена")],
+    ],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -426,6 +444,23 @@ async def get_user_home_courts(tg_id: int) -> List[aiosqlite.Row]:
         await cursor.close()
         return list(rows)
 
+
+async def delete_user(tg_id: int):
+    """
+    Удаляет пользователя и его домашние корты.
+    Нужен для /reset, чтобы можно было пройти онбординг заново.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM user_home_courts WHERE telegram_id = ?;",
+            (tg_id,),
+        )
+        await db.execute(
+            "DELETE FROM users WHERE telegram_id = ?;",
+            (tg_id,),
+        )
+        await db.commit()
+
 # -----------------------------------------
 # Логика рейтинга
 # -----------------------------------------
@@ -510,7 +545,7 @@ def compute_final_ntrp(
     return round(final, 2)
 
 # -----------------------------------------
-# Хэндлеры
+# Хэндлеры: старт, профиль, reset, edit
 # -----------------------------------------
 
 @dp.message(CommandStart())
@@ -522,7 +557,9 @@ async def start_cmd(message: Message, state: FSMContext):
         await message.answer(
             "Привет 👋\n"
             "Ты уже проходил анкету.\n\n"
-            "Посмотреть профиль → /me",
+            "Посмотреть профиль → /me\n"
+            "Изменить профиль → /edit\n"
+            "Сбросить и пройти заново → /reset",
         )
         return
 
@@ -581,6 +618,144 @@ async def profile_cmd(message: Message):
     else:
         await message.answer(txt, parse_mode="HTML")
 
+
+@dp.message(F.text == "/reset")
+async def reset_cmd(message: Message, state: FSMContext):
+    # Сброс состояния и удаления данных
+    await state.clear()
+    await delete_user(message.from_user.id)
+    await message.answer(
+        "Я сбросил твою анкету и данные профиля.\n\n"
+        "Теперь можно пройти все заново — жми /start 🙂",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(F.text == "/edit")
+async def edit_cmd(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "Пока у тебя нет профиля.\nСначала пройди анкету через /start 🙂"
+        )
+        return
+
+    await state.clear()
+    await state.set_state(EditProfile.choose_field)
+    await message.answer(
+        "Что хочешь изменить?",
+        reply_markup=edit_menu_kb,
+    )
+
+# ---------- Редактор профиля ----------
+
+@dp.message(EditProfile.choose_field)
+async def edit_choose_field(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Город":
+        await state.set_state(EditProfile.city)
+        await message.answer(
+            "Напиши новый город, в котором ты обычно играешь:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    elif text == "О себе":
+        await state.set_state(EditProfile.about)
+        await message.answer(
+            "Напиши новый текст «о себе».\n"
+            "Если передумаешь — отправь слово «Пропустить».",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    elif text == "Фото":
+        await state.set_state(EditProfile.photo)
+        await message.answer(
+            "Отправь новое фото для профиля 📷\n"
+            "Или отправь «Пропустить», если не хочешь менять.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    elif text == "Отмена":
+        await state.clear()
+        await message.answer(
+            "Окей, ничего не меняем 🙂",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов на клавиатуре 🙂",
+            reply_markup=edit_menu_kb,
+        )
+
+@dp.message(EditProfile.city)
+async def edit_city(message: Message, state: FSMContext):
+    city = (message.text or "").strip()
+    if not city:
+        await message.answer("Нужно указать город текстом. Попробуй ещё раз 🙂")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET city = ? WHERE telegram_id = ?;",
+            (city, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        f"Город обновлён: {city}\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+@dp.message(EditProfile.about)
+async def edit_about(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text.lower().startswith("пропус"):
+        about = None
+    else:
+        about = text
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET about = ? WHERE telegram_id = ?;",
+            (about, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        "Текст «о себе» обновлён ✅\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+@dp.message(EditProfile.photo)
+async def edit_photo(message: Message, state: FSMContext):
+    if message.text and message.text.strip().lower().startswith("пропус"):
+        photo_file_id = None
+    elif message.photo:
+        photo_file_id = message.photo[-1].file_id
+    else:
+        await message.answer("Пожалуйста, отправь фото или «Пропустить» 🙂")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET photo_file_id = ? WHERE telegram_id = ?;",
+            (photo_file_id, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        "Фото профиля обновлено ✅\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+# -----------------------------------------
+# Остальные хэндлеры онбординга
+# -----------------------------------------
 
 @dp.message(Onboarding.name)
 async def get_name(message: Message, state: FSMContext):
