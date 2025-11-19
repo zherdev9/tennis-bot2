@@ -2,8 +2,8 @@ import os
 import re
 import asyncio
 import logging
-from datetime import date
-from typing import List, Optional
+from datetime import date, datetime, timedelta
+from typing import List, Optional, Dict, Any
 
 import aiosqlite
 from aiohttp import web
@@ -16,6 +16,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
 )
 
 # -----------------------------------------
@@ -45,8 +48,11 @@ dp = Dispatcher()
 HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
 
+# Глобальное хранилище фильтров списка матчей (по юзеру)
+user_game_filters: Dict[int, Dict[str, Any]] = {}
+
 # -----------------------------------------
-# FSM: анкета, редактирование, поддержка, игры
+# FSM
 # -----------------------------------------
 
 class Onboarding(StatesGroup):
@@ -79,15 +85,21 @@ class HelpState(StatesGroup):
     waiting_text = State()
 
 
-class NewGame(StatesGroup):
-    kind = State()
+class GameCreation(StatesGroup):
+    mode = State()
     date = State()
     time = State()
     court = State()
     players_count = State()
-    rating_limit_choice = State()
+    ranked_choice = State()
     rating_range = State()
     comment = State()
+
+
+class GamesFilter(StatesGroup):
+    date = State()
+    level = State()
+    home_only = State()
 
 
 # -----------------------------------------
@@ -112,6 +124,61 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
         - ((today.month, today.day) < (dob.month, dob.day))
     )
     return age
+
+
+def parse_date_ddmmyyyy(text: str) -> Optional[str]:
+    """
+    Принимает 'ДД.ММ.ГГГГ', 'сегодня', 'завтра'.
+    Возвращает 'ГГГГ-ММ-ДД' или None.
+    """
+    text = text.strip().lower()
+    today = date.today()
+
+    if text in ("сегодня", "today"):
+        d = today
+    elif text in ("завтра", "tomorrow"):
+        d = today + timedelta(days=1)
+    else:
+        if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
+            return None
+        try:
+            day, month, year = map(int, text.split("."))
+            d = date(year, month, day)
+        except ValueError:
+            return None
+
+    return d.strftime("%Y-%m-%d")
+
+
+def parse_time_hhmm(text: str) -> Optional[str]:
+    """
+    Ожидает 'ЧЧ:ММ' (24 часа). Возвращает ту же строку или None.
+    """
+    text = text.strip()
+    if not re.match(r"^\d{2}:\d{2}$", text):
+        return None
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError:
+        return None
+    return text
+
+
+def parse_rating_range(text: str) -> Optional[tuple]:
+    """
+    Парсит диапазон рейтинга формата '3.0-3.75' / '3,0–3,75'.
+    Возвращает (min, max) или None.
+    """
+    text = text.strip().lower().replace(",", ".")
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*[-–]\s*([0-9]+(?:\.[0-9]+)?)$", text)
+    if not m:
+        return None
+    r1, r2 = float(m.group(1)), float(m.group(2))
+    if r1 > r2:
+        r1, r2 = r2, r1
+    if r1 < 1.0 or r2 > 7.0:
+        return None
+    return (round(r1, 2), round(r2, 2))
 
 
 # -----------------------------------------
@@ -226,10 +293,11 @@ edit_menu_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-game_kind_kb = ReplyKeyboardMarkup(
+newgame_type_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Тренировка")],
         [KeyboardButton(text="Матч на рейтинг")],
+        [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
@@ -244,7 +312,7 @@ players_count_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-rating_limit_choice_kb = ReplyKeyboardMarkup(
+yes_no_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
     ],
@@ -275,6 +343,31 @@ def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+
+def build_single_court_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
+    """
+    Клавиатура для выбора ОДНОГО корта (при создании игры).
+    """
+    buttons: List[List[KeyboardButton]] = []
+    row: List[KeyboardButton] = []
+
+    for i, court in enumerate(courts, start=1):
+        row.append(KeyboardButton(text=court["short_name"]))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([KeyboardButton(text="Отмена")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 # -----------------------------------------
 # База данных
 # -----------------------------------------
@@ -286,36 +379,35 @@ async def init_db():
             """
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                name TEXT,
-                gender TEXT,
-                city TEXT,
-                ntrp REAL,
-                ntrp_self REAL,
+                username    TEXT,
+                name        TEXT,
+                gender      TEXT,
+                city        TEXT,
+                ntrp        REAL,
+                ntrp_self   REAL,
                 play_experience TEXT,
-                matches_6m TEXT,
-                fitness TEXT,
+                matches_6m  TEXT,
+                fitness     TEXT,
                 tournaments TEXT,
-                birth_date TEXT,
-                about TEXT,
+                birth_date  TEXT,
+                about       TEXT,
                 photo_file_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
-        await _ensure_user_columns(db)
 
-        # courts (каталог кортов ты заполняешь отдельно)
+        # courts – ты уже наполнил её своим каталогом
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS courts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slug TEXT UNIQUE,
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug       TEXT UNIQUE,
                 short_name TEXT NOT NULL,
-                full_name TEXT,
-                address TEXT,
-                area TEXT,
-                is_active INTEGER DEFAULT 1
+                full_name  TEXT,
+                address    TEXT,
+                area       TEXT,
+                is_active  INTEGER DEFAULT 1
             );
             """
         )
@@ -324,30 +416,43 @@ async def init_db():
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_home_courts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
-                court_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                court_id    INTEGER NOT NULL,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
 
-        # games (созданные игры/матчи)
+        # games – историчность матчей
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                creator_tg_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,              -- 'training' или 'rating'
-                game_date TEXT,                  -- ДД.ММ.ГГГГ
-                game_time TEXT,                  -- HH:MM
-                city TEXT,
-                court_id INTEGER,
-                court_name TEXT,
-                players_count INTEGER,
-                rating_min REAL,
-                rating_max REAL,
-                comment TEXT,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_id    INTEGER NOT NULL,
+                court_id      INTEGER NOT NULL,
+                game_date     TEXT NOT NULL,   -- YYYY-MM-DD
+                game_time     TEXT NOT NULL,   -- HH:MM
+                game_type     TEXT NOT NULL,   -- 'Тренировка' / 'Матч на рейтинг'
+                is_ranked     INTEGER NOT NULL DEFAULT 0,
+                players_count INTEGER NOT NULL,
+                rating_min    REAL,
+                rating_max    REAL,
+                comment       TEXT,
+                status        TEXT NOT NULL DEFAULT 'open',
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+        # game_applications – заявки на игры (тоже историчные)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_applications (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id    INTEGER NOT NULL,
+                player_id  INTEGER NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -356,39 +461,7 @@ async def init_db():
         await db.commit()
 
 
-async def _ensure_user_columns(db: aiosqlite.Connection):
-    cursor = await db.execute("PRAGMA table_info(users);")
-    cols = await cursor.fetchall()
-    await cursor.close()
-    existing = {c[1] for c in cols}
-
-    needed = {
-        "username": "TEXT",
-        "name": "TEXT",
-        "gender": "TEXT",
-        "city": "TEXT",
-        "ntrp": "REAL",
-        "ntrp_self": "REAL",
-        "play_experience": "TEXT",
-        "matches_6m": "TEXT",
-        "fitness": "TEXT",
-        "tournaments": "TEXT",
-        "birth_date": "TEXT",
-        "about": "TEXT",
-        "photo_file_id": "TEXT",
-        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    }
-
-    for col, coltype in needed.items():
-        if col not in existing:
-            await db.execute(f"ALTER TABLE users ADD COLUMN {col} {coltype};")
-
-
 async def get_active_courts() -> List[aiosqlite.Row]:
-    """
-    Возвращает активные корты. Предполагается, что
-    таблица courts уже заполнена твоим каталогом.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -510,8 +583,7 @@ async def get_user_home_courts(tg_id: int) -> List[aiosqlite.Row]:
 
 async def delete_user(tg_id: int):
     """
-    Удаляет пользователя и его домашние корты.
-    Нужен для /reset, чтобы можно было пройти онбординг заново.
+    Удаляет пользователя и его домашние корты. Нужен для /reset.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -526,36 +598,37 @@ async def delete_user(tg_id: int):
 
 
 async def create_game(
-    creator_tg_id: int,
-    kind: str,
+    creator_id: int,
+    court_id: int,
     game_date: str,
     game_time: str,
-    city: Optional[str],
-    court_name: str,
-    court_id: Optional[int],
+    game_type: str,
+    is_ranked: bool,
     players_count: int,
     rating_min: Optional[float],
     rating_max: Optional[float],
     comment: Optional[str],
 ) -> int:
+    """
+    Создаёт игру, возвращает id.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
             INSERT INTO games (
-                creator_tg_id, kind, game_date, game_time, city,
-                court_id, court_name, players_count,
-                rating_min, rating_max, comment
+                creator_id, court_id, game_date, game_time,
+                game_type, is_ranked, players_count,
+                rating_min, rating_max, comment, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open');
             """,
             (
-                creator_tg_id,
-                kind,
+                creator_id,
+                court_id,
                 game_date,
                 game_time,
-                city,
-                court_id,
-                court_name,
+                game_type,
+                1 if is_ranked else 0,
                 players_count,
                 rating_min,
                 rating_max,
@@ -566,38 +639,121 @@ async def create_game(
         return cursor.lastrowid
 
 
-async def get_upcoming_games(limit: int = 10):
+async def get_game(game_id: int) -> Optional[aiosqlite.Row]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT g.*, c.short_name AS court_name, c.address AS court_address,
+                   u.name AS creator_name, u.ntrp AS creator_ntrp
+            FROM games g
+            JOIN courts c ON c.id = g.court_id
+            JOIN users u ON u.telegram_id = g.creator_id
+            WHERE g.id = ?;
+            """,
+            (game_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+
+async def list_games_for_user(
+    tg_id: int,
+    offset: int = 0,
+    limit: int = 10,
+) -> List[aiosqlite.Row]:
     """
-    Простейший список ближайших игр.
+    Список игр с учётом фильтра user_game_filters[tg_id].
+    Только открытые игры, начиная с сегодняшней даты.
     """
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
-                SELECT
-                    id,
-                    kind,
-                    game_date,
-                    game_time,
-                    city,
-                    court_name,
-                    players_count,
-                    rating_min,
-                    rating_max
-                FROM games
-                WHERE game_date IS NOT NULL
-                ORDER BY game_date, game_time
-                LIMIT ?;
-                """,
-                (limit,),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return list(rows)
-    except Exception as e:
-        logger.exception("Failed to fetch games: %s", e)
-        return []
+    filters = user_game_filters.get(tg_id, {})
+    date_filter = filters.get("date")
+    rating_min = filters.get("rating_min")
+    rating_max = filters.get("rating_max")
+    home_only = filters.get("home_only", False)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        where = ["g.status = 'open'"]
+        params: List[Any] = []
+
+        today_str = date.today().strftime("%Y-%m-%d")
+        where.append("g.game_date >= ?")
+        params.append(today_str)
+
+        if date_filter:
+            where.append("g.game_date = ?")
+            params.append(date_filter)
+
+        if rating_min is not None:
+            # Игра либо без ограничений, либо нижняя граница не выше желаемого минимума
+            where.append("(g.rating_min IS NULL OR g.rating_min <= ?)")
+            params.append(rating_min)
+
+        if rating_max is not None:
+            # Игра либо без ограничений, либо верхняя граница не ниже желаемого максимума
+            where.append("(g.rating_max IS NULL OR g.rating_max >= ?)")
+            params.append(rating_max)
+
+        join_home = ""
+        if home_only:
+            join_home = """
+                JOIN user_home_courts uh
+                  ON uh.court_id = g.court_id AND uh.telegram_id = ?
+            """
+            params.insert(0, tg_id)
+
+        where_sql = " AND ".join(where)
+
+        sql = f"""
+            SELECT g.*, c.short_name AS court_name, c.address AS court_address,
+                   u.name AS creator_name, u.ntrp AS creator_ntrp
+            FROM games g
+            JOIN courts c ON c.id = g.court_id
+            JOIN users u ON u.telegram_id = g.creator_id
+            {join_home}
+            WHERE {where_sql}
+            ORDER BY g.game_date, g.game_time, g.id
+            LIMIT ? OFFSET ?;
+        """
+        params.extend([limit, offset])
+
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+
+async def add_game_application(game_id: int, player_id: int) -> bool:
+    """
+    Создаёт заявку на игру, если её ещё не было. Возвращает True/False.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*) FROM game_applications
+            WHERE game_id = ? AND player_id = ?;
+            """,
+            (game_id, player_id),
+        )
+        row = await cursor.fetchone()
+        already = row[0] > 0
+        await cursor.close()
+
+        if already:
+            return False
+
+        await db.execute(
+            """
+            INSERT INTO game_applications (game_id, player_id, status)
+            VALUES (?, ?, 'pending');
+            """,
+            (game_id, player_id),
+        )
+        await db.commit()
+        return True
 
 
 # -----------------------------------------
@@ -684,7 +840,7 @@ def compute_final_ntrp(
     return round(final, 2)
 
 # -----------------------------------------
-# Хэндлеры: старт, профиль, reset, edit, help, games
+# Команды: старт, профиль, reset, edit
 # -----------------------------------------
 
 @dp.message(CommandStart())
@@ -696,13 +852,13 @@ async def start_cmd(message: Message, state: FSMContext):
         await message.answer(
             "Привет 👋\n"
             "Ты уже проходил анкету.\n\n"
-            "Команды:\n"
-            "/start — начать онбординг / показать это сообщение\n"
+            "Доступные команды:\n"
+            "/start — начать онбординг / показать это меню\n"
             "/me — показать мой профиль\n"
             "/edit — изменить профиль\n"
             "/reset — сбросить анкету и пройти заново\n"
             "/newgame — создать новую игру\n"
-            "/games — посмотреть список игр\n"
+            "/games — список доступных игр\n"
             "/help — написать в поддержку",
         )
         return
@@ -999,7 +1155,6 @@ async def edit_home_courts(message: Message, state: FSMContext):
     name_to_addr = {c["short_name"]: c["address"] for c in courts}
 
     if text == HOME_SKIP:
-        # Ничего не меняем
         await state.clear()
         await message.answer(
             "Домашние корты оставлены без изменений.",
@@ -1055,55 +1210,6 @@ async def edit_home_courts(message: Message, state: FSMContext):
         f"Можешь выбрать ещё или нажать «{HOME_DONE}», когда закончишь.",
         reply_markup=build_home_courts_kb(courts),
         parse_mode="HTML",
-    )
-
-
-@dp.message(EditProfile.about)
-async def edit_about(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if text.lower().startswith("пропус"):
-        about = None
-    else:
-        about = text
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET about = ? WHERE telegram_id = ?;",
-            (about, message.from_user.id),
-        )
-        await db.commit()
-
-    await state.clear()
-    await message.answer(
-        "Текст «о себе» обновлён ✅\n\n"
-        "Посмотреть профиль → /me",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@dp.message(EditProfile.photo)
-async def edit_photo(message: Message, state: FSMContext):
-    if message.text and message.text.strip().lower().startswith("пропус"):
-        photo_file_id = None
-    elif message.photo:
-        photo_file_id = message.photo[-1].file_id
-    else:
-        await message.answer("Пожалуйста, отправь фото или «Пропустить» 🙂")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET photo_file_id = ? WHERE telegram_id = ?;",
-            (photo_file_id, message.from_user.id),
-        )
-        await db.commit()
-
-    await state.clear()
-    await message.answer(
-        "Фото профиля обновлено ✅\n\n"
-        "Посмотреть профиль → /me",
-        reply_markup=ReplyKeyboardRemove(),
     )
 
 # ---------- Поддержка: /help ----------
@@ -1171,7 +1277,7 @@ async def help_text_handler(message: Message, state: FSMContext):
     )
 
 # -----------------------------------------
-# Онбординг
+# Онбординг (остальные шаги)
 # -----------------------------------------
 
 @dp.message(Onboarding.name)
@@ -1210,7 +1316,7 @@ async def get_gender(message: Message, state: FSMContext):
 
 
 @dp.message(Onboarding.city)
-async def get_city(message: Message, state: FSMContext):
+async def onboarding_city(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     data = await state.get_data()
 
@@ -1256,12 +1362,11 @@ async def get_city(message: Message, state: FSMContext):
 
 
 @dp.message(Onboarding.home_courts)
-async def home_courts_handler(message: Message, state: FSMContext):
+async def onboarding_home_courts(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     data = await state.get_data()
     selected_ids: List[int] = data.get("home_courts", []) or []
 
-    # Пропустить
     if text == HOME_SKIP:
         await state.update_data(home_courts=[])
         await message.answer(
@@ -1272,7 +1377,6 @@ async def home_courts_handler(message: Message, state: FSMContext):
         await state.set_state(Onboarding.ntrp)
         return
 
-    # Готово
     if text == HOME_DONE:
         courts = await get_active_courts()
         id_to_name = {c["id"]: c["short_name"] for c in courts}
@@ -1293,7 +1397,6 @@ async def home_courts_handler(message: Message, state: FSMContext):
         await state.set_state(Onboarding.ntrp)
         return
 
-    # Обычный корт
     courts = await get_active_courts()
     name_to_id = {c["short_name"]: c["id"] for c in courts}
     name_to_addr = {c["short_name"]: c["address"] for c in courts}
@@ -1468,7 +1571,7 @@ async def get_tournaments(message: Message, state: FSMContext):
 
 
 @dp.message(Onboarding.birth_date)
-async def get_birth_date(message: Message, state: FSMContext):
+async def onboarding_birth_date(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
     if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
@@ -1511,7 +1614,7 @@ async def get_birth_date(message: Message, state: FSMContext):
 
 
 @dp.message(Onboarding.about)
-async def get_about(message: Message, state: FSMContext):
+async def onboarding_about(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
     if text.lower().startswith("пропус"):
@@ -1530,7 +1633,7 @@ async def get_about(message: Message, state: FSMContext):
 
 
 @dp.message(Onboarding.photo)
-async def get_photo(message: Message, state: FSMContext):
+async def onboarding_photo(message: Message, state: FSMContext):
     if message.text and message.text.strip().lower().startswith("пропус"):
         photo_file_id = None
     elif message.photo:
@@ -1594,313 +1697,502 @@ async def get_photo(message: Message, state: FSMContext):
 # -----------------------------------------
 
 @dp.message(F.text == "/newgame")
-async def newgame_cmd(message: Message, state: FSMContext):
+async def newgame_start(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     if not user:
-        await message.answer("Сначала заполни профиль через /start 🙂")
+        await message.answer("Сначала нужно заполнить профиль через /start 🙂")
+        return
+    if not user["ntrp"]:
+        await message.answer(
+            "У тебя ещё нет рейтинга NTRP. Пройди онбординг заново через /reset, "
+            "если что-то пошло не так."
+        )
         return
 
     await state.clear()
-    await state.set_state(NewGame.kind)
+    await state.set_state(GameCreation.mode)
     await message.answer(
-        "Что создаём?\n"
-        "• Тренировка\n"
-        "• Матч на рейтинг",
-        reply_markup=game_kind_kb,
+        "Что создаём?",
+        reply_markup=newgame_type_kb,
     )
 
 
-@dp.message(NewGame.kind)
-async def newgame_kind(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
+@dp.message(GameCreation.mode)
+async def newgame_mode(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
 
-    if text.startswith("трен"):
-        kind = "training"
-    elif text.startswith("матч"):
-        kind = "rating"
-    else:
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Окей, ничего не создаём 🙂", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if text not in ["Тренировка", "Матч на рейтинг"]:
         await message.answer(
-            "Пожалуйста, выбери «Тренировка» или «Матч на рейтинг» по кнопке 🙂",
-            reply_markup=game_kind_kb,
+            "Пожалуйста, выбери один из вариантов:",
+            reply_markup=newgame_type_kb,
         )
         return
 
-    await state.update_data(kind=kind)
-
+    await state.update_data(game_type=text)
+    await state.set_state(GameCreation.date)
     await message.answer(
-        "Укажи дату игры в формате ДД.ММ.ГГГГ\n"
-        "Например: 21.11.2025",
+        "На какую дату игра?\n"
+        "Формат: ДД.ММ.ГГГГ, либо напиши «Сегодня» или «Завтра».",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await state.set_state(NewGame.date)
 
 
-@dp.message(NewGame.date)
+@dp.message(GameCreation.date)
 async def newgame_date(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-
-    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
+    date_str = parse_date_ddmmyyyy(text)
+    if not date_str:
         await message.answer(
-            "Не похоже на дату 😅\n"
-            "Нужен формат ДД.ММ.ГГГГ, например: 21.11.2025",
+            "Не получилось распознать дату.\n"
+            "Используй формат ДД.ММ.ГГГГ или напиши «Сегодня» / «Завтра».",
         )
         return
 
-    await state.update_data(game_date=text)
-
+    await state.update_data(game_date=date_str)
+    await state.set_state(GameCreation.time)
     await message.answer(
-        "Во сколько играем? Формат ЧЧ:ММ\n"
-        "Например: 19:30",
+        "Во сколько начинаем?\nФормат: ЧЧ:ММ (24 часа), например 19:30.",
     )
-    await state.set_state(NewGame.time)
 
 
-@dp.message(NewGame.time)
+@dp.message(GameCreation.time)
 async def newgame_time(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-
-    if not re.match(r"^\d{2}:\d{2}$", text):
+    time_str = parse_time_hhmm(text)
+    if not time_str:
         await message.answer(
-            "Не похоже на время 😅\n"
-            "Нужен формат ЧЧ:ММ, например: 19:30",
+            "Не получилось распознать время.\n"
+            "Используй формат ЧЧ:ММ, например 19:30.",
         )
         return
 
-    await state.update_data(game_time=text)
+    courts = await get_active_courts()
+    if not courts:
+        await message.answer(
+            "В базе пока нет ни одного корта. Обратись к админу.",
+        )
+        await state.clear()
+        return
 
+    await state.update_data(game_time=time_str)
+    await state.set_state(GameCreation.court)
     await message.answer(
-        "На каком корте играем?\n"
-        "Напиши короткое название так, как оно указано в каталоге кортов.\n"
-        "Например: ITC Wegim",
+        "Выбери корт для игры:",
+        reply_markup=build_single_court_kb(courts),
     )
-    await state.set_state(NewGame.court)
 
 
-@dp.message(NewGame.court)
+@dp.message(GameCreation.court)
 async def newgame_court(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if not text:
-        await message.answer("Нужно указать название корта 🙂 Попробуй ещё раз.")
+
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
         return
 
     courts = await get_active_courts()
     name_to_id = {c["short_name"]: c["id"] for c in courts}
 
-    court_id = name_to_id.get(text)
-    court_name = text
+    if text not in name_to_id:
+        await message.answer(
+            "Пожалуйста, выбери корт из списка или нажми «Отмена».",
+            reply_markup=build_single_court_kb(courts),
+        )
+        return
 
-    await state.update_data(court_id=court_id, court_name=court_name)
-
+    await state.update_data(court_id=name_to_id[text])
+    await state.set_state(GameCreation.players_count)
     await message.answer(
-        "Сколько игроков будет?\n"
-        "Выбери 2 или 4 игрока.",
+        "Сколько игроков планируется?",
         reply_markup=players_count_kb,
     )
-    await state.set_state(NewGame.players_count)
 
 
-@dp.message(NewGame.players_count)
-async def newgame_players_count(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if "2" in text:
-        players_count = 2
-    elif "4" in text:
-        players_count = 4
+@dp.message(GameCreation.players_count)
+async def newgame_players(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "2 игрока":
+        players = 2
+    elif text == "4 игрока":
+        players = 4
     else:
         await message.answer(
-            "Пожалуйста, выбери «2 игрока» или «4 игрока» по кнопке 🙂",
+            "Пожалуйста, выбери один из вариантов:",
             reply_markup=players_count_kb,
         )
         return
 
-    await state.update_data(players_count=players_count)
+    await state.update_data(players_count=players)
 
-    await message.answer(
-        "Нужно ли ограничение по рейтингу?",
-        reply_markup=rating_limit_choice_kb,
-    )
-    await state.set_state(NewGame.rating_limit_choice)
-
-
-@dp.message(NewGame.rating_limit_choice)
-async def newgame_rating_limit_choice(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if text == "нет":
-        await state.update_data(rating_min=None, rating_max=None)
+    data = await state.get_data()
+    if data.get("game_type") == "Тренировка":
+        # Тренировка – ограничение по рейтингу не обязательно,
+        # но по твоей логике это не матч "на рейтинг" → is_ranked=False
+        await state.update_data(is_ranked=False, rating_min=None, rating_max=None)
+        await state.set_state(GameCreation.comment)
         await message.answer(
-            "Окей, без ограничений по рейтингу 👍",
+            "Добавь комментарий к игре (формат, уровень, пожелания)\n"
+            "Или напиши «Пропустить».",
             reply_markup=ReplyKeyboardRemove(),
         )
+    else:
+        await state.set_state(GameCreation.ranked_choice)
         await message.answer(
-            "Если хочешь, добавь короткий комментарий к игре (или отправь «Пропустить»).",
+            "Нужно ли ограничение по рейтингу?\n\n"
+            "Если да — выбери «Да», и далее введёшь диапазон.\n"
+            "Если нет — выбери «Нет».",
+            reply_markup=yes_no_kb,
         )
-        await state.set_state(NewGame.comment)
-        return
 
-    if text == "да":
+
+@dp.message(GameCreation.ranked_choice)
+async def newgame_ranked_choice(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+    # В любом случае это «матч на рейтинг», просто с/без фильтра
+    if text.startswith("нет"):
+        await state.update_data(is_ranked=True, rating_min=None, rating_max=None)
+        await state.set_state(GameCreation.comment)
+        await message.answer(
+            "Добавь комментарий к игре (формат, уровень, пожелания)\n"
+            "Или напиши «Пропустить».",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    elif text.startswith("да"):
+        await state.update_data(is_ranked=True)
+        await state.set_state(GameCreation.rating_range)
         await message.answer(
             "Введи диапазон рейтинга в формате, например: 3.0-3.75",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await state.set_state(NewGame.rating_range)
-        return
-
-    await message.answer(
-        "Пожалуйста, выбери «Да» или «Нет» на клавиатуре 🙂",
-        reply_markup=rating_limit_choice_kb,
-    )
+    else:
+        await message.answer(
+            "Пожалуйста, выбери «Да» или «Нет».",
+            reply_markup=yes_no_kb,
+        )
 
 
-@dp.message(NewGame.rating_range)
+@dp.message(GameCreation.rating_range)
 async def newgame_rating_range(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if text.startswith("без"):
-        await state.update_data(rating_min=None, rating_max=None)
+    text = (message.text or "").strip()
+    rng = parse_rating_range(text)
+    if not rng:
         await message.answer(
-            "Окей, без ограничений по рейтингу 👍",
-        )
-        await message.answer(
-            "Если хочешь, добавь короткий комментарий к игре (или отправь «Пропустить»).",
-        )
-        await state.set_state(NewGame.comment)
-        return
-
-    parts = re.split(r"[-–]", text)
-    if len(parts) != 2:
-        await message.answer(
-            "Не получилось разобрать диапазон 😅\n"
-            "Нужен формат вроде: 3.0-3.75",
+            "Не удалось распознать диапазон.\n"
+            "Используй формат, например: 3.0-3.75 (от 1.0 до 7.0).",
         )
         return
 
-    try:
-        left = float(parts[0].replace(",", "."))
-        right = float(parts[1].replace(",", "."))
-    except ValueError:
-        await message.answer(
-            "Не получилось разобрать числа 🤔\n"
-            "Пример корректного диапазона: 3.0-3.75",
-        )
-        return
-
-    if left > right:
-        left, right = right, left
-
-    left = max(1.0, min(7.0, left))
-    right = max(1.0, min(7.0, right))
-
-    await state.update_data(rating_min=round(left, 2), rating_max=round(right, 2))
-
+    rmin, rmax = rng
+    await state.update_data(rating_min=rmin, rating_max=rmax)
+    await state.set_state(GameCreation.comment)
     await message.answer(
-        f"Ок, диапазон рейтинга: {left:.2f}–{right:.2f}",
+        "Добавь комментарий к игре (формат, уровень, пожелания)\n"
+        "Или напиши «Пропустить».",
     )
-    await message.answer(
-        "Если хочешь, добавь короткий комментарий к игре (или отправь «Пропустить»).",
-    )
-    await state.set_state(NewGame.comment)
 
 
-@dp.message(NewGame.comment)
+@dp.message(GameCreation.comment)
 async def newgame_comment(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if text.lower().startswith("пропус"):
-        comment = None
-    else:
-        comment = text
+    comment = None if text.lower().startswith("пропус") else text
 
     data = await state.get_data()
     await state.clear()
 
-    user = await get_user(message.from_user.id)
-    city = user["city"] if user else None
-
-    kind = data.get("kind")          # 'training' / 'rating'
+    game_type = data.get("game_type")
     game_date = data.get("game_date")
     game_time = data.get("game_time")
     court_id = data.get("court_id")
-    court_name = data.get("court_name") or "Не указан"
-    players_count = data.get("players_count") or 2
+    players_count = data.get("players_count")
+    is_ranked = bool(data.get("is_ranked", False))
     rating_min = data.get("rating_min")
     rating_max = data.get("rating_max")
 
     game_id = await create_game(
-        creator_tg_id=message.from_user.id,
-        kind=kind,
+        creator_id=message.from_user.id,
+        court_id=court_id,
         game_date=game_date,
         game_time=game_time,
-        city=city,
-        court_name=court_name,
-        court_id=court_id,
+        game_type=game_type,
+        is_ranked=is_ranked,
         players_count=players_count,
         rating_min=rating_min,
         rating_max=rating_max,
         comment=comment,
     )
 
-    kind_txt = "Тренировка" if kind == "training" else "Матч на рейтинг"
-    rating_part = "Без ограничений"
+    game = await get_game(game_id)
+    rating_part = "Без ограничений по рейтингу"
     if rating_min is not None and rating_max is not None:
-        rating_part = f"{rating_min:.2f}–{rating_max:.2f}"
+        rating_part = f"Рейтинг: {rating_min:.2f}-{rating_max:.2f}"
 
-    lines = [
-        "Игра создана ✅",
-        f"ID: {game_id}",
-        f"Тип: {kind_txt}",
-        f"Дата: {game_date} {game_time}",
-        f"Город: {city or 'не указан'}",
-        f"Корт: {court_name}",
-        f"Игроков: {players_count}",
-        f"Диапазон рейтинга: {rating_part}",
-    ]
-    if comment:
-        lines.append(f"Комментарий: {comment}")
+    comment_part = f"Комментарий: {comment}" if comment else "Комментарий: —"
 
-    lines.append("\nДругие игроки смогут увидеть эту игру в списке /games.")
-    await message.answer("\n".join(lines))
+    txt = (
+        "Игра создана ✅\n\n"
+        f"ID: {game_id}\n"
+        f"Тип: {game_type}\n"
+        f"Дата: {game_date}\n"
+        f"Время: {game_time}\n"
+        f"Корт: {game['court_name']}\n"
+        f"📍 <i>{game['court_address'] or 'Адрес не указан'}</i>\n"
+        f"Игроков: {players_count}\n"
+        f"{rating_part}\n"
+        f"{comment_part}"
+    )
 
+    await message.answer(txt, parse_mode="HTML")
 
 # -----------------------------------------
-# Список игр: /games
+# Список игр и фильтры: /games
 # -----------------------------------------
 
-@dp.message(F.text.in_({"/games", "/matches"}))
-async def games_list_cmd(message: Message):
-    user = await get_user(message.from_user.id)
-    if not user:
-        await message.answer("Сначала заполни профиль через /start 🙂")
-        return
+async def send_games_list(message: Message, user_id: int, offset: int = 0):
+    games = await list_games_for_user(user_id, offset=offset, limit=10)
 
-    games = await get_upcoming_games(limit=10)
-
-    if not games:
+    if not games and offset == 0:
         await message.answer(
-            "Пока нет активных игр, которые можно показать.\n\n"
-            "Создать свою игру → /newgame"
+            "Пока нет доступных игр по твоим фильтрам.\n"
+            "Можешь создать свою игру через /newgame.",
+        )
+        return
+    if not games:
+        await message.answer("Больше игр не найдено 🙂")
+        return
+
+    for g in games:
+        rating_part = "Без ограничений по рейтингу"
+        if g["rating_min"] is not None and g["rating_max"] is not None:
+            rating_part = f"Рейтинг: {g['rating_min']:.2f}-{g['rating_max']:.2f}"
+
+        comment_part = f"Комментарий: {g['comment']}" if g["comment"] else "Комментарий: —"
+
+        text = (
+            f"🎾 Игра #{g['id']}\n"
+            f"{g['game_type']}\n"
+            f"Дата: {g['game_date']}\n"
+            f"Время: {g['game_time']}\n"
+            f"Корт: {g['court_name']}\n"
+            f"📍 <i>{g['court_address'] or 'Адрес не указан'}</i>\n"
+            f"Игроков: {g['players_count']}\n"
+            f"{rating_part}\n"
+            f"{comment_part}\n"
+            f"Создатель: {g['creator_name'] or '—'} (рейтинг {g['creator_ntrp'] or '—'})"
+        )
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Подать заявку",
+                        callback_data=f"apply:{g['id']}",
+                    )
+                ]
+            ]
+        )
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    # Кнопки "Фильтр" и "Ещё"
+    more_kb_buttons = [
+        [
+            InlineKeyboardButton(
+                text="Установить фильтр",
+                callback_data="setfilter",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Показать ещё",
+                callback_data=f"more:{offset + 10}",
+            )
+        ],
+    ]
+    more_kb = InlineKeyboardMarkup(inline_keyboard=more_kb_buttons)
+    await message.answer("Ещё опции:", reply_markup=more_kb)
+
+
+@dp.message(F.text == "/games")
+async def games_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    await send_games_list(message, message.from_user.id, offset=0)
+
+
+@dp.callback_query(F.data.startswith("more:"))
+async def games_more_callback(query: CallbackQuery):
+    try:
+        offset = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Ошибка параметров.")
+        return
+    await query.answer()
+    await send_games_list(query.message, query.from_user.id, offset=offset)
+
+
+@dp.callback_query(F.data == "setfilter")
+async def games_setfilter_callback(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await state.set_state(GamesFilter.date)
+    await bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            "Фильтр по дате: отправь дату в формате ДД.ММ.ГГГГ,\n"
+            "или напиши «Любая», чтобы не фильтровать по дате."
+        ),
+    )
+
+
+@dp.message(GamesFilter.date)
+async def filter_date(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+    if text == "любая":
+        await state.update_data(date=None)
+    else:
+        d = parse_date_ddmmyyyy(text)
+        if not d:
+            await message.answer(
+                "Не получилось распознать дату.\n"
+                "Используй формат ДД.ММ.ГГГГ или напиши «Любая».",
+            )
+            return
+        await state.update_data(date=d)
+
+    await state.set_state(GamesFilter.level)
+    await message.answer(
+        "Фильтр по уровню: введи диапазон NTRP, например 3.0-3.75,\n"
+        "или напиши «Любой», чтобы не фильтровать по уровню.",
+    )
+
+
+@dp.message(GamesFilter.level)
+async def filter_level(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+    if text == "любой":
+        await state.update_data(rating_min=None, rating_max=None)
+    else:
+        rng = parse_rating_range(text)
+        if not rng:
+            await message.answer(
+                "Не удалось распознать диапазон.\n"
+                "Используй формат 3.0-3.75 или напиши «Любой».",
+            )
+            return
+        rmin, rmax = rng
+        await state.update_data(rating_min=rmin, rating_max=rmax)
+
+    await state.set_state(GamesFilter.home_only)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(
+        "Показывать только игры на твоих домашних кортах?",
+        reply_markup=kb,
+    )
+
+
+@dp.message(GamesFilter.home_only)
+async def filter_home_only(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+    if text.startswith("да"):
+        home_only = True
+    elif text.startswith("нет"):
+        home_only = False
+    else:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await message.answer(
+            "Пожалуйста, выбери «Да» или «Нет».",
+            reply_markup=kb,
         )
         return
 
-    lines = ["🎾 <b>Доступные игры</b>\n"]
-    for g in games:
-        kind_txt = "Тренировка" if g["kind"] == "training" else "Матч на рейтинг"
-        rating_part = "Без ограничений"
-        if g["rating_min"] is not None and g["rating_max"] is not None:
-            rating_part = f"{g['rating_min']:.2f}–{g['rating_max']:.2f}"
+    data = await state.get_data()
+    await state.clear()
 
-        lines.append(
-            "————————————\n"
-            f"ID: {g['id']}\n"
-            f"Тип: {kind_txt}\n"
-            f"Дата: {g['game_date']} {g['game_time']}\n"
-            f"Город: {g['city'] or 'не указан'}\n"
-            f"Корт: {g['court_name'] or 'не указан'}\n"
-            f"Игроков: {g['players_count']}\n"
-            f"Диапазон рейтинга: {rating_part}"
+    user_game_filters[message.from_user.id] = {
+        "date": data.get("date"),
+        "rating_min": data.get("rating_min"),
+        "rating_max": data.get("rating_max"),
+        "home_only": home_only,
+    }
+
+    await message.answer(
+        "Фильтр обновлён ✅\nПоказываю игры с учётом фильтра:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await send_games_list(message, message.from_user.id, offset=0)
+
+# -----------------------------------------
+# Обработка заявок на игру (callback apply)
+# -----------------------------------------
+
+@dp.callback_query(F.data.startswith("apply:"))
+async def apply_game_callback(query: CallbackQuery):
+    try:
+        game_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Ошибка параметров.")
+        return
+
+    user = await get_user(query.from_user.id)
+    if not user:
+        await query.answer("Сначала заполни профиль через /start.", show_alert=True)
+        return
+
+    if not user["ntrp"]:
+        await query.answer(
+            "У тебя нет рейтинга NTRP. Пройди онбординг через /reset.",
+            show_alert=True,
         )
+        return
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    game = await get_game(game_id)
+    if not game or game["status"] != "open":
+        await query.answer("Игра уже недоступна.", show_alert=True)
+        return
+
+    user_rating = float(user["ntrp"])
+    g_min = game["rating_min"]
+    g_max = game["rating_max"]
+
+    if g_min is not None and g_max is not None:
+        if user_rating < g_min or user_rating > g_max:
+            await query.answer(
+                f"Создатель игры ограничил рейтинг участников: {g_min:.2f}-{g_max:.2f}.",
+                show_alert=True,
+            )
+            return
+
+    ok = await add_game_application(game_id, query.from_user.id)
+    if not ok:
+        await query.answer("Ты уже подавал заявку на эту игру.", show_alert=True)
+        return
+
+    await query.answer("Заявка отправлена ✅", show_alert=False)
+
+    # Уведомляем создателя игры
+    try:
+        creator_id = game["creator_id"]
+        text = (
+            "Новая заявка на игру 🎾\n\n"
+            f"Игра #{game_id} — {game['game_type']} {game['game_date']} {game['game_time']}\n"
+            f"Корт: {game['court_name']}\n"
+            f"Игрок: @{query.from_user.username or 'без username'} "
+            f"(ID {query.from_user.id}, рейтинг {user_rating:.2f})"
+        )
+        await bot.send_message(creator_id, text)
+    except Exception as e:
+        logger.exception("Failed to notify game creator: %s", e)
 
 # -----------------------------------------
 # HTTP-сервер для Render (healthcheck)
