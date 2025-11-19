@@ -404,6 +404,28 @@ async def upsert_user(
         )
         await db.commit()
 
+
+async def get_user_home_courts(tg_id: int) -> List[aiosqlite.Row]:
+    """
+    Возвращает список домашних кортов пользователя:
+    rows с полями short_name, address
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT c.short_name, c.address
+            FROM user_home_courts uh
+            JOIN courts c ON c.id = uh.court_id
+            WHERE uh.telegram_id = ?
+            ORDER BY c.short_name;
+            """,
+            (tg_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
 # -----------------------------------------
 # Логика рейтинга
 # -----------------------------------------
@@ -521,19 +543,34 @@ async def profile_cmd(message: Message):
         await message.answer("Ты ещё не проходил анкету. Жми /start")
         return
 
-    txt = (
-        "📋 <b>Твой профиль</b>\n\n"
-        f"Имя: {user['name']}\n"
-        f"Пол: {user['gender'] or 'Не указывать'}\n"
-        f"Город: {user['city'] or 'не указан'}\n"
-        f"Рейтинг NTRP: {user['ntrp'] or '—'}\n"
-        f"Опыт игры: {user['play_experience'] or '—'}\n"
-        f"Матчей за 6 мес: {user['matches_6m'] or '—'}\n"
-        f"Физподготовка: {user['fitness'] or '—'}\n"
-        f"Турниры: {user['tournaments'] or '—'}\n"
-        f"Дата рождения: {user['birth_date'] or '—'}\n"
-        f"О себе: {user['about'] or '—'}"
-    )
+    # Домашние корты
+    home_courts = await get_user_home_courts(message.from_user.id)
+
+    lines = [
+        "📋 <b>Твой профиль</b>\n",
+        f"Имя: {user['name']}",
+        f"Пол: {user['gender'] or 'Не указывать'}",
+        f"Город: {user['city'] or 'не указан'}",
+        f"Рейтинг NTRP: {user['ntrp'] or '—'}",
+        f"Опыт игры: {user['play_experience'] or '—'}",
+        f"Матчей за 6 мес: {user['matches_6m'] or '—'}",
+        f"Физподготовка: {user['fitness'] or '—'}",
+        f"Турниры: {user['tournaments'] or '—'}",
+        f"Дата рождения: {user['birth_date'] or '—'}",
+        f"О себе: {user['about'] or '—'}",
+    ]
+
+    if home_courts:
+        lines.append("")
+        lines.append("📍 Домашние корты:")
+        for row in home_courts:
+            addr = row["address"] or "Адрес не указан"
+            lines.append(f"• {row['short_name']} — {addr}")
+    else:
+        lines.append("")
+        lines.append("📍 Домашние корты: не выбраны")
+
+    txt = "\n".join(lines)
 
     if user["photo_file_id"]:
         await message.answer_photo(
@@ -883,6 +920,7 @@ async def get_about(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.photo)
 async def get_photo(message: Message, state: FSMContext):
+    # Фото или "Пропустить"
     if message.text and message.text.strip().lower().startswith("пропус"):
         photo_file_id = None
     elif message.photo:
@@ -894,7 +932,13 @@ async def get_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    base_ntrp = data.get("ntrp_self")
+    # ntrp_self может быть строкой → приводим к float
+    base_ntrp_raw = data.get("ntrp_self")
+    try:
+        base_ntrp = float(base_ntrp_raw) if base_ntrp_raw is not None else 3.0
+    except (TypeError, ValueError):
+        base_ntrp = 3.0
+
     play_experience = data.get("play_experience")
     matches_6m = data.get("matches_6m")
     fitness = data.get("fitness")
