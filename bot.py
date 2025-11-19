@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import List, Optional
 
 import aiosqlite
@@ -36,17 +36,17 @@ MIN_AGE = 18
 # но отсеиваем совсем нереалистичные даты > 100 лет
 MAX_REALISTIC_AGE = 100
 
+# Ограничение на создание матчей: не в прошлом и не дальше чем на 3 месяца вперёд
+MAX_MATCH_DAYS_AHEAD = 90
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-HOME_DONE = "Готово ✅"
-HOME_SKIP = "Пропустить"
-
 # -----------------------------------------
-# FSM анкеты, редактирования, поддержки
+# FSM анкеты, редактирования, поддержки, матчей
 # -----------------------------------------
 
 class Onboarding(StatesGroup):
@@ -86,10 +86,12 @@ class NewGame(StatesGroup):
     time = State()
     game_type = State()
     rating_limit_choice = State()
-    rating_range = State()
+    rating_min = State()
+    rating_max = State()
     players_count = State()
+    court_booking = State()
+    privacy = State()
     comment = State()
-
 
 # -----------------------------------------
 # Хелперы
@@ -115,33 +117,116 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     return age
 
 
-def parse_rating_range(raw: str) -> Optional[tuple[float, float]]:
+def parse_time(text: str) -> Optional[str]:
     """
-    Парсит строку типа '3.0-3.75' или '3,0–3,75' → (3.0, 3.75)
-    Возвращает None, если не получилось.
+    Ожидаем формат ЧЧ:ММ (24 часа). Возвращаем нормализованную строку 'HH:MM' или None.
     """
-    if not raw:
-        return None
-    txt = raw.replace(" ", "").replace(",", ".")
-    # поддерживаем '-' и '–'
-    if "–" in txt:
-        parts = txt.split("–", 1)
-    else:
-        parts = txt.split("-", 1)
-    if len(parts) != 2:
+    text = text.strip()
+    if not re.match(r"^\d{1,2}:\d{2}$", text):
         return None
     try:
-        low = float(parts[0])
-        high = float(parts[1])
+        hh, mm = map(int, text.split(":"))
     except ValueError:
         return None
-    if low <= 0 or high <= 0 or low > high:
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return None
-    # разумные пределы NTRP
-    if low < 1.0 or high > 7.0:
-        return None
-    return round(low, 2), round(high, 2)
+    return f"{hh:02d}:{mm:02d}"
 
+
+def parse_ntrp_from_button(text: str) -> Optional[float]:
+    if not text:
+        return None
+    head = text.split("—", 1)[0].strip()
+    head = head.replace(" ", "")
+    if "–" in head:
+        part = head.split("–", 1)[0]
+    elif "-" in head:
+        part = head.split("-", 1)[0]
+    else:
+        part = head
+    part = part.replace(",", ".")
+    try:
+        return float(part)
+    except ValueError:
+        return None
+
+
+def parse_rating_value(text: str) -> Optional[float]:
+    """
+    Парсим значение рейтинга из кнопок вида '1.0', '1.5', '2.0', ... '7.0'
+    """
+    if not text:
+        return None
+    t = text.replace(",", ".").strip()
+    try:
+        val = float(t)
+    except ValueError:
+        return None
+    if val < 1.0 or val > 7.0:
+        return None
+    return round(val, 2)
+
+
+def normalize_custom_ntrp(value: float) -> float:
+    if value < 1.0:
+        value = 1.0
+    if value > 7.0:
+        value = 7.0
+    return round(value, 2)
+
+
+def compute_final_ntrp(
+    base_ntrp: float,
+    play_experience: Optional[str],
+    matches_6m: Optional[str],
+    fitness: Optional[str],
+    tournaments: Optional[str],
+) -> float:
+    mod = 0.0
+    pe = (play_experience or "").lower()
+    m6 = (matches_6m or "").lower()
+    fit = (fitness or "").lower()
+    tour = (tournaments or "").lower()
+
+    # Как давно играл
+    if "никогда" in pe:
+        mod -= 0.25
+    elif "в этом году" in pe:
+        mod += 0.10
+    elif "более года" in pe:
+        mod -= 0.05
+    elif "более пяти" in pe:
+        mod -= 0.15
+
+    # Матчи за 6 месяцев
+    if "0–10" in m6 or "0-10" in m6:
+        mod += 0.0
+    elif "10–100" in m6 or "10-100" in m6:
+        mod += 0.15
+    elif "100" in m6:
+        mod += 0.25
+
+    # Физподготовка
+    if "низкая" in fit:
+        mod -= 0.15
+    elif "хорошая" in fit:
+        mod += 0.0
+    elif "отличная" in fit:
+        mod += 0.10
+
+    # Турниры
+    if "tour" in tour:
+        mod += 0.15
+    elif "masters" in tour:
+        mod += 0.30
+
+    final = base_ntrp + mod
+    if final < 1.0:
+        final = 1.0
+    if final > 7.0:
+        final = 7.0
+
+    return round(final, 2)
 
 # -----------------------------------------
 # Клавиатуры
@@ -255,41 +340,8 @@ edit_menu_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-game_type_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Тренировка")],
-        [KeyboardButton(text="Матч на рейтинг")],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
-rating_limit_choice_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
-players_count_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="2 игрока")],
-        [KeyboardButton(text="4 игрока")],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
-date_choice_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра")],
-        [KeyboardButton(text="Ввести дату")],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
+HOME_DONE = "Готово ✅"
+HOME_SKIP = "Пропустить"
 
 def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
     buttons: List[List[KeyboardButton]] = []
@@ -312,6 +364,108 @@ def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
+def build_courts_single_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
+    """
+    Клавиатура для выбора одного корта (создание матча).
+    """
+    buttons: List[List[KeyboardButton]] = []
+    row: List[KeyboardButton] = []
+
+    for i, court in enumerate(courts, start=1):
+        row.append(KeyboardButton(text=court["short_name"]))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([KeyboardButton(text="Отмена")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+# Кнопки выбора даты матча
+date_choice_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сегодня")],
+        [KeyboardButton(text="Завтра")],
+        [KeyboardButton(text="Ввести дату")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+# Тип игры
+game_type_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Тренировка")],
+        [KeyboardButton(text="Матч на рейтинг")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+# Ограничение по рейтингу
+rating_limit_choice_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Да"), KeyboardButton(text="Без ограничений")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+# Значения рейтинга для диапазона (1.0, 1.5, ..., 7.0)
+rating_values = [f"{x / 2:.1f}".replace(".", ".") for x in range(2, 15)]  # 1.0..7.0
+
+def build_rating_kb() -> ReplyKeyboardMarkup:
+    row = []
+    rows = []
+    for i, val in enumerate(rating_values, start=1):
+        row.append(KeyboardButton(text=val))
+        if i % 4 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+# Кол-во игроков
+players_count_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="2 игрока")],
+        [KeyboardButton(text="4 игрока")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+# Бронь корта
+court_booking_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Корт уже забронирован")],
+        [KeyboardButton(text="Корт пока не забронирован")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+# Приватность
+privacy_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Публичный матч")],
+        [KeyboardButton(text="Приватный матч")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
 
 # -----------------------------------------
 # База данных
@@ -358,6 +512,29 @@ async def init_db():
             """
         )
 
+        # games
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_id INTEGER NOT NULL,
+                court_id INTEGER NOT NULL,
+                match_date TEXT NOT NULL,
+                match_time TEXT NOT NULL,
+                game_type TEXT NOT NULL,
+                rating_min REAL,
+                rating_max REAL,
+                players_count INTEGER NOT NULL,
+                comment TEXT,
+                is_court_booked INTEGER DEFAULT 0,
+                visibility TEXT DEFAULT 'public',
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        await _ensure_games_columns(db)
+
         # user_home_courts
         await db.execute(
             """
@@ -370,28 +547,6 @@ async def init_db():
             """
         )
 
-        # games (упрощённая версия, пока без заявок/поиска-матчей UI)
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                creator_id INTEGER NOT NULL,
-                court_id INTEGER NOT NULL,
-                match_date TEXT NOT NULL,   -- ISO: YYYY-MM-DD
-                match_time TEXT NOT NULL,   -- HH:MM
-                game_type TEXT NOT NULL,    -- 'training' / 'rating'
-                rating_min REAL,
-                rating_max REAL,
-                players_count INTEGER NOT NULL,
-                comment TEXT,
-                is_active INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-
-        # загрузка кортов из SQL-скрипта, если таблица пустая
-        await seed_courts_from_sql_if_empty(db)
         await db.commit()
 
 
@@ -423,29 +578,21 @@ async def _ensure_user_columns(db: aiosqlite.Connection):
             await db.execute(f"ALTER TABLE users ADD COLUMN {col} {coltype};")
 
 
-async def seed_courts_from_sql_if_empty(db: aiosqlite.Connection):
-    """
-    Если в таблице courts нет записей – пробуем загрузить их из файла courts_seed_big.sql.
-    Если файл не найден или пустой – просто логируем предупреждение, бот продолжит работать.
-    """
-    cursor = await db.execute("SELECT COUNT(*) FROM courts;")
-    row = await cursor.fetchone()
+async def _ensure_games_columns(db: aiosqlite.Connection):
+    cursor = await db.execute("PRAGMA table_info(games);")
+    cols = await cursor.fetchall()
     await cursor.close()
-    count = row[0] if row is not None else 0
+    existing = {c[1] for c in cols}
 
-    if count > 0:
-        return
+    needed = {
+        "is_court_booked": "INTEGER DEFAULT 0",
+        "visibility": "TEXT DEFAULT 'public'",
+        "is_active": "INTEGER DEFAULT 1",
+    }
 
-    try:
-        with open("courts_seed_big.sql", "r", encoding="utf-8") as f:
-            sql = f.read()
-        if sql.strip():
-            await db.executescript(sql)
-            logger.info("Courts seeded from courts_seed_big.sql")
-        else:
-            logger.warning("courts_seed_big.sql is empty.")
-    except FileNotFoundError:
-        logger.warning("courts_seed_big.sql not found; courts table will stay empty.")
+    for col, coltype in needed.items():
+        if col not in existing:
+            await db.execute(f"ALTER TABLE games ADD COLUMN {col} {coltype};")
 
 
 async def get_active_courts() -> List[aiosqlite.Row]:
@@ -457,6 +604,18 @@ async def get_active_courts() -> List[aiosqlite.Row]:
         rows = await cursor.fetchall()
         await cursor.close()
         return list(rows)
+
+
+async def get_court_by_id(court_id: int) -> Optional[aiosqlite.Row]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM courts WHERE id = ?;",
+            (court_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
 
 
 async def save_user_home_courts(telegram_id: int, court_ids: List[int]):
@@ -584,88 +743,50 @@ async def delete_user(tg_id: int):
         )
         await db.commit()
 
-# -----------------------------------------
-# Логика рейтинга
-# -----------------------------------------
 
-def parse_ntrp_from_button(text: str) -> Optional[float]:
-    if not text:
-        return None
-    head = text.split("—", 1)[0].strip()
-    head = head.replace(" ", "")
-    if "–" in head:
-        part = head.split("–", 1)[0]
-    elif "-" in head:
-        part = head.split("-", 1)[0]
-    else:
-        part = head
-    part = part.replace(",", ".")
-    try:
-        return float(part)
-    except ValueError:
-        return None
-
-
-def normalize_custom_ntrp(value: float) -> float:
-    if value < 1.0:
-        value = 1.0
-    if value > 7.0:
-        value = 7.0
-    return round(value, 2)
-
-
-def compute_final_ntrp(
-    base_ntrp: float,
-    play_experience: Optional[str],
-    matches_6m: Optional[str],
-    fitness: Optional[str],
-    tournaments: Optional[str],
-) -> float:
-    mod = 0.0
-    pe = (play_experience or "").lower()
-    m6 = (matches_6m or "").lower()
-    fit = (fitness or "").lower()
-    tour = (tournaments or "").lower()
-
-    # Как давно играл
-    if "никогда" in pe:
-        mod -= 0.25
-    elif "в этом году" in pe:
-        mod += 0.10
-    elif "более года" in pe:
-        mod -= 0.05
-    elif "более пяти" in pe:
-        mod -= 0.15
-
-    # Матчи за 6 месяцев
-    if "0–10" in m6 or "0-10" in m6:
-        mod += 0.0
-    elif "10–100" in m6 or "10-100" in m6:
-        mod += 0.15
-    elif "100" in m6:
-        mod += 0.25
-
-    # Физподготовка
-    if "низкая" in fit:
-        mod -= 0.15
-    elif "хорошая" in fit:
-        mod += 0.0
-    elif "отличная" in fit:
-        mod += 0.10
-
-    # Турниры
-    if "tour" in tour:
-        mod += 0.15
-    elif "masters" in tour:
-        mod += 0.30
-
-    final = base_ntrp + mod
-    if final < 1.0:
-        final = 1.0
-    if final > 7.0:
-        final = 7.0
-
-    return round(final, 2)
+async def create_game(
+    creator_id: int,
+    court_id: int,
+    match_date: str,
+    match_time: str,
+    game_type: str,
+    rating_min: Optional[float],
+    rating_max: Optional[float],
+    players_count: int,
+    comment: Optional[str],
+    is_court_booked: bool,
+    visibility: str,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO games (
+                creator_id, court_id, match_date, match_time,
+                game_type, rating_min, rating_max,
+                players_count, comment,
+                is_court_booked, visibility, is_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
+            """,
+            (
+                creator_id,
+                court_id,
+                match_date,
+                match_time,
+                game_type,
+                rating_min,
+                rating_max,
+                players_count,
+                comment,
+                1 if is_court_booked else 0,
+                visibility,
+            ),
+        )
+        cursor = await db.execute("SELECT last_insert_rowid();")
+        row = await cursor.fetchone()
+        await cursor.close()
+        await db.commit()
+        return row[0]
 
 # -----------------------------------------
 # Хэндлеры: старт, профиль, reset, edit, help, newgame
@@ -681,11 +802,12 @@ async def start_cmd(message: Message, state: FSMContext):
             "Привет 👋\n"
             "Ты уже проходил анкету.\n\n"
             "Команды:\n"
-            "• /me — посмотреть профиль\n"
-            "• /edit — изменить профиль\n"
-            "• /newgame — создать новую игру\n"
-            "• /reset — сбросить анкету и пройти заново\n"
-            "• /help — написать в поддержку",
+            "/start — начать онбординг / показать меню\n"
+            "/me — показать мой профиль\n"
+            "/edit — изменить профиль\n"
+            "/reset — сбросить анкету и пройти заново\n"
+            "/newgame — создать новую игру\n"
+            "/help — написать в поддержку",
         )
         return
 
@@ -1152,348 +1274,8 @@ async def help_text_handler(message: Message, state: FSMContext):
         "Если нужно, он свяжется с тобой в Телеграме.",
     )
 
-# ---------- Создание новой игры: /newgame ----------
-
-@dp.message(F.text == "/newgame")
-async def newgame_cmd(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
-    if not user:
-        await message.answer(
-            "Сначала нужно заполнить профиль.\n"
-            "Жми /start и пройди анкету 🙂"
-        )
-        return
-
-    if not user["ntrp"]:
-        await message.answer(
-            "У тебя ещё нет рейтинга NTRP.\n"
-            "Пройди анкету заново через /reset, чтобы его посчитать."
-        )
-        return
-
-    courts = await get_active_courts()
-    if not courts:
-        await message.answer(
-            "Пока в базе нет ни одного корта.\n"
-            "Попроси админа импортировать файл courts_seed_big.sql "
-            "или добавить корты вручную в таблицу courts.\n\n"
-            "После этого можно будет создавать игры.",
-        )
-        return
-
-    await state.clear()
-    await state.set_state(NewGame.court)
-
-    kb = build_home_courts_kb(courts)
-    # в режиме создания игры нам нужен выбор одного корта,
-    # но можно использовать ту же клавиатуру (игнорируя Готово/Пропустить на этом шаге)
-    await message.answer(
-        "Создаём новую игру 🎾\n\n"
-        "Выбери корт, на котором планируешь играть:",
-        reply_markup=kb,
-    )
-
-
-@dp.message(NewGame.court)
-async def newgame_choose_court(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if text in (HOME_DONE, HOME_SKIP):
-        await message.answer(
-            "Здесь нужно выбрать конкретный корт из списка 🙂"
-        )
-        return
-
-    courts = await get_active_courts()
-    name_to_id = {c["short_name"]: c["id"] for c in courts}
-
-    if text not in name_to_id:
-        await message.answer(
-            "Пожалуйста, выбери корт из списка.",
-            reply_markup=build_home_courts_kb(courts),
-        )
-        return
-
-    court_id = name_to_id[text]
-    await state.update_data(court_id=court_id, court_name=text)
-
-    await state.set_state(NewGame.date_choice)
-    await message.answer(
-        "Выбери дату матча:",
-        reply_markup=date_choice_kb,
-    )
-
-
-@dp.message(NewGame.date_choice)
-async def newgame_date_choice(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if text.startswith("сегод"):
-        d = date.today()
-    elif text.startswith("завтр"):
-        d = date.today() + timedelta(days=1)
-    elif text.startswith("ввести"):
-        await state.set_state(NewGame.date_manual)
-        await message.answer(
-            "Введи дату матча в формате ДД.ММ.ГГГГ\n"
-            "Например: 25.12.2025",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    else:
-        await message.answer(
-            "Пожалуйста, выбери один из вариантов:\n"
-            "«Сегодня», «Завтра» или «Ввести дату».",
-            reply_markup=date_choice_kb,
-        )
-        return
-
-    # дата выбрана через Сегодня/Завтра
-    match_date_iso = d.isoformat()
-    await state.update_data(match_date=match_date_iso)
-
-    await state.set_state(NewGame.time)
-    await message.answer(
-        "Укажи время матча в формате ЧЧ:ММ\n"
-        "Например: 19:30",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@dp.message(NewGame.date_manual)
-async def newgame_date_manual(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
-        await message.answer(
-            "Не похоже на дату 😅\n"
-            "Нужен формат ДД.ММ.ГГГГ, например: 25.12.2025",
-        )
-        return
-
-    try:
-        day, month, year = map(int, text.split("."))
-        d = date(year, month, day)
-    except ValueError:
-        await message.answer(
-            "Такой даты не существует.\n"
-            "Проверь и введи ещё раз."
-        )
-        return
-
-    # Можно добавить логику «не давать прошлые даты», если захочешь.
-    match_date_iso = d.isoformat()
-    await state.update_data(match_date=match_date_iso)
-
-    await state.set_state(NewGame.time)
-    await message.answer(
-        "Укажи время матча в формате ЧЧ:ММ\n"
-        "Например: 19:30",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@dp.message(NewGame.time)
-async def newgame_time(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if not re.match(r"^\d{2}:\d{2}$", text):
-        await message.answer(
-            "Нужно время в формате ЧЧ:ММ, например: 19:30",
-        )
-        return
-
-    try:
-        hour, minute = map(int, text.split(":"))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except ValueError:
-        await message.answer(
-            "Неверное время. Часы 00–23, минуты 00–59.\n"
-            "Попробуй ещё раз.",
-        )
-        return
-
-    await state.update_data(match_time=f"{hour:02d}:{minute:02d}")
-
-    await state.set_state(NewGame.game_type)
-    await message.answer(
-        "Это будет тренировка или матч на рейтинг?",
-        reply_markup=game_type_kb,
-    )
-
-
-@dp.message(NewGame.game_type)
-async def newgame_type(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if text.startswith("трен"):
-        game_type = "training"
-    elif text.startswith("матч"):
-        game_type = "rating"
-    else:
-        await message.answer(
-            "Пожалуйста, выбери:\n"
-            "• Тренировка\n"
-            "• Матч на рейтинг",
-            reply_markup=game_type_kb,
-        )
-        return
-
-    await state.update_data(game_type=game_type)
-
-    await state.set_state(NewGame.rating_limit_choice)
-    await message.answer(
-        "Нужно ли ограничение по рейтингу?\n\n"
-        "Если да — введём диапазон, например: 3.0-3.75\n"
-        "Если нет — игры будут открыты для любого рейтинга.",
-        reply_markup=rating_limit_choice_kb,
-    )
-
-
-@dp.message(NewGame.rating_limit_choice)
-async def newgame_rating_limit_choice(message: Message, state: FSMContext):
-    text = (message.text or "").strip().lower()
-
-    if text.startswith("нет"):
-        # без ограничений по рейтингу
-        await state.update_data(rating_min=None, rating_max=None)
-        await state.set_state(NewGame.players_count)
-        await message.answer(
-            "Сколько игроков в матче?",
-            reply_markup=players_count_kb,
-        )
-        return
-
-    if text.startswith("да"):
-        await state.set_state(NewGame.rating_range)
-        await message.answer(
-            "Введи диапазон рейтинга, например: 3.0-3.75",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-
-    await message.answer(
-        "Пожалуйста, выбери «Да» или «Нет».",
-        reply_markup=rating_limit_choice_kb,
-    )
-
-
-@dp.message(NewGame.rating_range)
-async def newgame_rating_range(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    parsed = parse_rating_range(text)
-    if not parsed:
-        await message.answer(
-            "Не получилось разобрать диапазон 😅\n"
-            "Пример: 3.0-3.75",
-        )
-        return
-
-    low, high = parsed
-    await state.update_data(rating_min=low, rating_max=high)
-
-    await state.set_state(NewGame.players_count)
-    await message.answer(
-        "Сколько игроков в матче?",
-        reply_markup=players_count_kb,
-    )
-
-
-@dp.message(NewGame.players_count)
-async def newgame_players_count(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if "2" in text:
-        players = 2
-    elif "4" in text:
-        players = 4
-    else:
-        await message.answer(
-            "Сейчас доступны варианты: «2 игрока» или «4 игрока».",
-            reply_markup=players_count_kb,
-        )
-        return
-
-    await state.update_data(players_count=players)
-
-    await state.set_state(NewGame.comment)
-    await message.answer(
-        "Добавь комментарий к матчу (например, формат, покрытие, уровень партнеров).\n"
-        "Или отправь «Пропустить».",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@dp.message(NewGame.comment)
-async def newgame_comment(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if text.lower().startswith("пропус"):
-        comment = None
-    else:
-        comment = text
-
-    data = await state.get_data()
-    await state.clear()
-
-    court_id = data.get("court_id")
-    match_date_iso = data.get("match_date")
-    match_time = data.get("match_time")
-    game_type = data.get("game_type")
-    rating_min = data.get("rating_min")
-    rating_max = data.get("rating_max")
-    players_count = data.get("players_count")
-
-    if not (court_id and match_date_iso and match_time and game_type and players_count):
-        await message.answer(
-            "Что-то пошло не так при создании игры. Попробуй ещё раз /newgame."
-        )
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO games (
-                creator_id, court_id, match_date, match_time,
-                game_type, rating_min, rating_max, players_count, comment
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """,
-            (
-                message.from_user.id,
-                court_id,
-                match_date_iso,
-                match_time,
-                game_type,
-                rating_min,
-                rating_max,
-                players_count,
-                comment,
-            ),
-        )
-        await db.commit()
-
-    # Человеческий текст для подтверждения
-    d = datetime.fromisoformat(match_date_iso).strftime("%d.%m.%Y")
-    type_text = "Тренировка" if game_type == "training" else "Матч на рейтинг"
-    rating_text = "без ограничений"
-    if rating_min is not None and rating_max is not None:
-        rating_text = f"{rating_min:.2f}-{rating_max:.2f}"
-
-    await message.answer(
-        "Игра создана ✅\n\n"
-        f"Тип: {type_text}\n"
-        f"Дата: {d}\n"
-        f"Время: {match_time}\n"
-        f"Игроков: {players_count}\n"
-        f"Ограничение по рейтингу: {rating_text}\n"
-        f"Комментарий: {comment or '—'}",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
 # -----------------------------------------
-# Остальные хэндлеры онбординга
+# Онбординг
 # -----------------------------------------
 
 @dp.message(Onboarding.name)
@@ -1910,6 +1692,433 @@ async def get_photo(message: Message, state: FSMContext):
         "Посмотреть профиль → /me",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+# -----------------------------------------
+# Создание матча: /newgame
+# -----------------------------------------
+
+@dp.message(F.text == "/newgame")
+async def newgame_cmd(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "Сначала нужно заполнить профиль.\n"
+            "Пройди онбординг через /start 🙂"
+        )
+        return
+
+    courts = await get_active_courts()
+    if not courts:
+        await message.answer(
+            "В базе пока нет ни одного корта. Обратись к админу.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    await state.clear()
+    await state.set_state(NewGame.court)
+    await message.answer(
+        "Создаём новую игру 🎾\n\n"
+        "Выбери корт, на котором планируешь играть:",
+        reply_markup=build_courts_single_kb(courts),
+    )
+
+
+@dp.message(NewGame.court)
+async def newgame_court(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    courts = await get_active_courts()
+    name_to_id = {c["short_name"]: c["id"] for c in courts}
+
+    if text not in name_to_id:
+        await message.answer(
+            "Пожалуйста, выбери корт из списка или нажми «Отмена».",
+            reply_markup=build_courts_single_kb(courts),
+        )
+        return
+
+    cid = name_to_id[text]
+    await state.update_data(court_id=cid, court_name=text)
+
+    await state.set_state(NewGame.date_choice)
+    await message.answer(
+        "Выбери дату матча:",
+        reply_markup=date_choice_kb,
+    )
+
+
+@dp.message(NewGame.date_choice)
+async def newgame_date_choice(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    today = date.today()
+
+    if text == "Сегодня":
+        match_date_obj = today
+    elif text == "Завтра":
+        match_date_obj = today + timedelta(days=1)
+    elif text == "Ввести дату":
+        await state.set_state(NewGame.date_manual)
+        await message.answer(
+            "Укажи дату матча в формате ДД.ММ.ГГГГ\n"
+            "Например: 25.11.2024",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    else:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов: Сегодня, Завтра или Ввести дату 🙂",
+            reply_markup=date_choice_kb,
+        )
+        return
+
+    # Проверка ограничений (на всякий случай, хотя сегодня/завтра всегда ок)
+    max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
+    if match_date_obj < today:
+        await message.answer(
+            "Нельзя создать игру в прошлом.\n"
+            "Выбери дату не раньше сегодняшнего дня.",
+            reply_markup=date_choice_kb,
+        )
+        return
+    if match_date_obj > max_date:
+        await message.answer(
+            "Нельзя создавать игры более чем на 3 месяца вперёд.\n"
+            "Выбери дату ближе по времени.",
+            reply_markup=date_choice_kb,
+        )
+        return
+
+    match_date_str = match_date_obj.strftime("%d.%m.%Y")
+    await state.update_data(match_date=match_date_str)
+
+    await state.set_state(NewGame.time)
+    await message.answer(
+        f"Дата матча: {match_date_str}\n\n"
+        "Укажи время начала в формате ЧЧ:ММ\n"
+        "Например: 19:30",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(NewGame.date_manual)
+async def newgame_date_manual(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
+        await message.answer(
+            "Не похоже на дату 😅\n"
+            "Нужен формат ДД.ММ.ГГГГ, например: 25.11.2024",
+        )
+        return
+
+    try:
+        day, month, year = map(int, text.split("."))
+        match_date_obj = date(year, month, day)
+    except ValueError:
+        await message.answer(
+            "Не получилось разобрать дату.\n"
+            "Проверь формат и попробуй ещё раз.",
+        )
+        return
+
+    today = date.today()
+    max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
+
+    if match_date_obj < today:
+        await message.answer(
+            "Нельзя создать игру в прошлом.\n"
+            "Выбери дату не раньше сегодняшнего дня.",
+        )
+        return
+
+    if match_date_obj > max_date:
+        await message.answer(
+            "Нельзя создавать игры более чем на 3 месяца вперёд.\n"
+            "Выбери дату ближе по времени.",
+        )
+        return
+
+    match_date_str = match_date_obj.strftime("%d.%m.%Y")
+    await state.update_data(match_date=match_date_str)
+
+    await state.set_state(NewGame.time)
+    await message.answer(
+        f"Дата матча: {match_date_str}\n\n"
+        "Укажи время начала в формате ЧЧ:ММ\n"
+        "Например: 19:30",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(NewGame.time)
+async def newgame_time(message: Message, state: FSMContext):
+    time_str = parse_time(message.text or "")
+    if not time_str:
+        await message.answer(
+            "Не похоже на время 😅\n"
+            "Нужен формат ЧЧ:ММ, например: 19:30",
+        )
+        return
+
+    await state.update_data(match_time=time_str)
+
+    await state.set_state(NewGame.game_type)
+    await message.answer(
+        "Выбери тип игры:",
+        reply_markup=game_type_kb,
+    )
+
+
+@dp.message(NewGame.game_type)
+async def newgame_game_type(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text not in ["Тренировка", "Матч на рейтинг"]:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов: Тренировка или Матч на рейтинг 🙂",
+            reply_markup=game_type_kb,
+        )
+        return
+
+    await state.update_data(game_type=text)
+
+    await state.set_state(NewGame.rating_limit_choice)
+    await message.answer(
+        "Нужно ли ограничение по рейтингу?\n\n"
+        "Если да — дальше выберешь диапазон.\n"
+        "Если нет — игра будет доступна для любого уровня.",
+        reply_markup=rating_limit_choice_kb,
+    )
+
+
+@dp.message(NewGame.rating_limit_choice)
+async def newgame_rating_limit_choice(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Без ограничений":
+        # Сразу переходим к выбору количества игроков
+        await state.update_data(rating_min=None, rating_max=None)
+        await state.set_state(NewGame.players_count)
+        await message.answer(
+            "Сколько игроков планируется?",
+            reply_markup=players_count_kb,
+        )
+        return
+
+    if text == "Да":
+        await state.set_state(NewGame.rating_min)
+        await message.answer(
+            "Выбери минимальный рейтинг игрока:",
+            reply_markup=build_rating_kb(),
+        )
+        return
+
+    await message.answer(
+        "Пожалуйста, выбери «Да» или «Без ограничений».",
+        reply_markup=rating_limit_choice_kb,
+    )
+
+
+@dp.message(NewGame.rating_min)
+async def newgame_rating_min(message: Message, state: FSMContext):
+    val = parse_rating_value(message.text or "")
+    if val is None:
+        await message.answer(
+            "Не удалось распознать рейтинг.\n"
+            "Выбери значение по кнопке (от 1.0 до 7.0).",
+            reply_markup=build_rating_kb(),
+        )
+        return
+
+    await state.update_data(rating_min=val)
+
+    await state.set_state(NewGame.rating_max)
+    await message.answer(
+        f"Минимальный рейтинг: {val:.1f}\n"
+        "Теперь выбери максимальный рейтинг (не ниже минимального):",
+        reply_markup=build_rating_kb(),
+    )
+
+
+@dp.message(NewGame.rating_max)
+async def newgame_rating_max(message: Message, state: FSMContext):
+    data = await state.get_data()
+    rating_min_val = data.get("rating_min")
+
+    val = parse_rating_value(message.text or "")
+    if val is None:
+        await message.answer(
+            "Не удалось распознать рейтинг.\n"
+            "Выбери значение по кнопке (от 1.0 до 7.0).",
+            reply_markup=build_rating_kb(),
+        )
+        return
+
+    if rating_min_val is not None and val < rating_min_val:
+        await message.answer(
+            f"Максимальный рейтинг не может быть меньше минимального ({rating_min_val:.1f}).\n"
+            "Попробуй ещё раз.",
+            reply_markup=build_rating_kb(),
+        )
+        return
+
+    await state.update_data(rating_max=val)
+
+    await state.set_state(NewGame.players_count)
+    await message.answer(
+        "Сколько игроков планируется?",
+        reply_markup=players_count_kb,
+    )
+
+
+@dp.message(NewGame.players_count)
+async def newgame_players_count(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "2 игрока":
+        cnt = 2
+    elif text == "4 игрока":
+        cnt = 4
+    else:
+        await message.answer(
+            "Пожалуйста, выбери 2 игрока или 4 игрока 🙂",
+            reply_markup=players_count_kb,
+        )
+        return
+
+    await state.update_data(players_count=cnt)
+
+    await state.set_state(NewGame.court_booking)
+    await message.answer(
+        "Корт на это время уже забронирован?",
+        reply_markup=court_booking_kb,
+    )
+
+
+@dp.message(NewGame.court_booking)
+async def newgame_court_booking(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Корт уже забронирован":
+        booked = True
+    elif text == "Корт пока не забронирован":
+        booked = False
+    else:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов:\n"
+            "«Корт уже забронирован» или «Корт пока не забронирован».",
+            reply_markup=court_booking_kb,
+        )
+        return
+
+    await state.update_data(is_court_booked=booked)
+
+    await state.set_state(NewGame.privacy)
+    await message.answer(
+        "Укажи приватность матча:\n\n"
+        "• Публичный матч — будет виден в общем списке игр.\n"
+        "• Приватный матч — для приглашённых, не показывается в списке.",
+        reply_markup=privacy_kb,
+    )
+
+
+@dp.message(NewGame.privacy)
+async def newgame_privacy(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Публичный матч":
+        visibility = "public"
+    elif text == "Приватный матч":
+        visibility = "private"
+    else:
+        await message.answer(
+            "Пожалуйста, выбери «Публичный матч» или «Приватный матч».",
+            reply_markup=privacy_kb,
+        )
+        return
+
+    await state.update_data(visibility=visibility)
+
+    await state.set_state(NewGame.comment)
+    await message.answer(
+        "Добавь комментарий к игре (например, формат, пожелания).\n"
+        "Если ничего не хочешь добавлять — отправь «Пропустить».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(NewGame.comment)
+async def newgame_comment(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower().startswith("пропус"):
+        comment = None
+    else:
+        comment = text
+
+    data = await state.get_data()
+    await state.clear()
+
+    court_id = data.get("court_id")
+    court_name = data.get("court_name")
+    match_date = data.get("match_date")
+    match_time = data.get("match_time")
+    game_type = data.get("game_type")
+    rating_min = data.get("rating_min")
+    rating_max = data.get("rating_max")
+    players_count = data.get("players_count")
+    is_court_booked = data.get("is_court_booked", False)
+    visibility = data.get("visibility", "public")
+
+    game_id = await create_game(
+        creator_id=message.from_user.id,
+        court_id=court_id,
+        match_date=match_date,
+        match_time=match_time,
+        game_type=game_type,
+        rating_min=rating_min,
+        rating_max=rating_max,
+        players_count=players_count,
+        comment=comment,
+        is_court_booked=is_court_booked,
+        visibility=visibility,
+    )
+
+    court_row = await get_court_by_id(court_id)
+    if court_row:
+        addr = court_row["address"] or "Адрес не указан"
+    else:
+        addr = "Адрес не указан"
+
+    if rating_min is not None and rating_max is not None:
+        rating_text = f"{rating_min:.2f}-{rating_max:.2f}"
+    else:
+        rating_text = "Без ограничений"
+
+    booking_text = "забронирован" if is_court_booked else "не забронирован"
+    privacy_text = "приватный матч" if visibility == "private" else "публичный матч"
+
+    comment_text = comment if comment else "—"
+
+    txt = (
+        "Игра создана ✅\n\n"
+        f"ID игры: {game_id}\n"
+        f"Тип: {game_type}\n"
+        f"Дата: {match_date}\n"
+        f"Время: {match_time}\n"
+        f"Корт: {court_name} — <i>📍 {addr}</i>\n"
+        f"Игроков: {players_count}\n"
+        f"Ограничение по рейтингу: {rating_text}\n"
+        f"Бронь корта: {booking_text}\n"
+        f"Приватность: {privacy_text}\n"
+        f"Комментарий: {comment_text}"
+    )
+
+    await message.answer(txt, parse_mode="HTML")
 
 # -----------------------------------------
 # HTTP-сервер для Render (healthcheck)
