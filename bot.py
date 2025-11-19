@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+from datetime import date
 from typing import List, Optional
 
 import aiosqlite
@@ -28,8 +29,10 @@ if not BOT_TOKEN:
 DB_PATH = "tennis.db"
 
 # ID админа, куда будут прилетать обращения по /help
-# (если захочешь вынести в ENV, можно заменить на os.getenv("ADMIN_CHAT_ID"))
 ADMIN_CHAT_ID = 199804073
+
+MIN_AGE = 18
+MAX_AGE = 90
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,7 +87,11 @@ class Onboarding(StatesGroup):
 
 class EditProfile(StatesGroup):
     choose_field = State()
+    name = State()
+    gender = State()
     city = State()
+    birth_date = State()
+    home_courts = State()
     about = State()
     photo = State()
 
@@ -93,13 +100,35 @@ class HelpState(StatesGroup):
     waiting_text = State()
 
 # -----------------------------------------
+# Хелперы
+# -----------------------------------------
+
+def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
+    """
+    birth_date_str: 'ДД.ММ.ГГГГ'
+    Возвращает возраст в полных годах или None, если дата некорректна.
+    """
+    try:
+        day, month, year = map(int, birth_date_str.split("."))
+        dob = date(year, month, day)
+    except ValueError:
+        return None
+
+    today = date.today()
+    age = (
+        today.year
+        - dob.year
+        - ((today.month, today.day) < (dob.month, dob.day))
+    )
+    return age
+
+# -----------------------------------------
 # Клавиатуры
 # -----------------------------------------
 
 gender_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Мужчина"), KeyboardButton(text="Женщина")],
-        [KeyboardButton(text="Не указывать")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
@@ -195,9 +224,10 @@ skip_about_kb = ReplyKeyboardMarkup(
 
 edit_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Город")],
-        [KeyboardButton(text="О себе")],
-        [KeyboardButton(text="Фото")],
+        [KeyboardButton(text="Имя"), KeyboardButton(text="Пол")],
+        [KeyboardButton(text="Город"), KeyboardButton(text="Дата рождения")],
+        [KeyboardButton(text="Домашние корты")],
+        [KeyboardButton(text="О себе"), KeyboardButton(text="Фото")],
         [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
@@ -594,7 +624,7 @@ async def profile_cmd(message: Message):
     lines = [
         "📋 <b>Твой профиль</b>\n",
         f"Имя: {user['name']}",
-        f"Пол: {user['gender'] or 'Не указывать'}",
+        f"Пол: {user['gender'] or 'не указан'}",
         f"Город: {user['city'] or 'не указан'}",
         f"Рейтинг NTRP: {user['ntrp'] or '—'}",
         f"Опыт игры: {user['play_experience'] or '—'}",
@@ -660,12 +690,54 @@ async def edit_cmd(message: Message, state: FSMContext):
 async def edit_choose_field(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
-    if text == "Город":
+    if text == "Имя":
+        await state.set_state(EditProfile.name)
+        await message.answer(
+            "Введи новое имя:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    elif text == "Пол":
+        await state.set_state(EditProfile.gender)
+        await message.answer(
+            "Выбери пол:",
+            reply_markup=gender_kb,
+        )
+
+    elif text == "Город":
         await state.set_state(EditProfile.city)
         await message.answer(
             "Напиши новый город, в котором ты обычно играешь:",
             reply_markup=ReplyKeyboardRemove(),
         )
+
+    elif text == "Дата рождения":
+        await state.set_state(EditProfile.birth_date)
+        await message.answer(
+            "Введи новую дату рождения в формате ДД.ММ.ГГГГ\n"
+            "Например: 31.12.1990",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    elif text == "Домашние корты":
+        courts = await get_active_courts()
+        if not courts:
+            await message.answer(
+                "Пока нет доступных кортов для выбора. Обратись к админу.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await state.clear()
+            return
+
+        await state.update_data(home_courts=[])
+        await state.set_state(EditProfile.home_courts)
+        await message.answer(
+            "Выбери один или несколько домашних кортов.\n"
+            "Нажимай по кнопкам, чтобы добавить/убрать корт.\n"
+            "Когда закончишь, нажми «Готово ✅». Если не хочешь менять — «Пропустить».",
+            reply_markup=build_home_courts_kb(courts),
+        )
+
     elif text == "О себе":
         await state.set_state(EditProfile.about)
         await message.answer(
@@ -673,6 +745,7 @@ async def edit_choose_field(message: Message, state: FSMContext):
             "Если передумаешь — отправь слово «Пропустить».",
             reply_markup=ReplyKeyboardRemove(),
         )
+
     elif text == "Фото":
         await state.set_state(EditProfile.photo)
         await message.answer(
@@ -680,17 +753,68 @@ async def edit_choose_field(message: Message, state: FSMContext):
             "Или отправь «Пропустить», если не хочешь менять.",
             reply_markup=ReplyKeyboardRemove(),
         )
+
     elif text == "Отмена":
         await state.clear()
         await message.answer(
             "Окей, ничего не меняем 🙂",
             reply_markup=ReplyKeyboardRemove(),
         )
+
     else:
         await message.answer(
             "Пожалуйста, выбери один из вариантов на клавиатуре 🙂",
             reply_markup=edit_menu_kb,
         )
+
+
+@dp.message(EditProfile.name)
+async def edit_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Имя не может быть пустым. Попробуй ещё раз 🙂")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET name = ? WHERE telegram_id = ?;",
+            (name, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        f"Имя обновлено: {name}\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(EditProfile.gender)
+async def edit_gender(message: Message, state: FSMContext):
+    gender_raw = (message.text or "").strip().lower()
+
+    if gender_raw.startswith("муж"):
+        gender = "Мужчина"
+    elif gender_raw.startswith("жен"):
+        gender = "Женщина"
+    else:
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET gender = ? WHERE telegram_id = ?;",
+            (gender, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        f"Пол обновлён: {gender}\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @dp.message(EditProfile.city)
@@ -712,6 +836,110 @@ async def edit_city(message: Message, state: FSMContext):
         f"Город обновлён: {city}\n\n"
         "Посмотреть профиль → /me",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(EditProfile.birth_date)
+async def edit_birth_date(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
+        await message.answer(
+            "Не похоже на дату 😅\n"
+            "Нужен формат ДД.ММ.ГГГГ, например: 31.12.1990",
+        )
+        return
+
+    age = calculate_age_from_str(text)
+    if age is None or age < MIN_AGE or age > MAX_AGE:
+        await message.answer(
+            f"Этот сервис доступен только пользователям от {MIN_AGE} до {MAX_AGE} лет.\n"
+            "Проверь дату рождения и введи ещё раз.",
+        )
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET birth_date = ? WHERE telegram_id = ?;",
+            (text, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        "Дата рождения обновлена ✅\n\n"
+        "Посмотреть профиль → /me",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(EditProfile.home_courts)
+async def edit_home_courts(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    selected_ids: List[int] = data.get("home_courts", []) or []
+
+    courts = await get_active_courts()
+    name_to_id = {c["short_name"]: c["id"] for c in courts}
+    name_to_addr = {c["short_name"]: c["address"] for c in courts}
+
+    if text == HOME_SKIP:
+        # Ничего не меняем
+        await state.clear()
+        await message.answer(
+            "Домашние корты оставлены без изменений.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    if text == HOME_DONE:
+        await save_user_home_courts(message.from_user.id, selected_ids)
+        await state.clear()
+        if selected_ids:
+            id_to_name = {c["id"]: c["short_name"] for c in courts}
+            chosen_names = [id_to_name.get(cid, str(cid)) for cid in selected_ids]
+            summary = "Твои домашние корты обновлены: " + ", ".join(chosen_names)
+        else:
+            summary = "Ты не выбрал ни одного домашнего корта."
+        await message.answer(
+            summary + "\n\nПосмотреть профиль → /me",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    if text not in name_to_id:
+        await message.answer(
+            "Пожалуйста, выбери корт из списка или нажми «Готово ✅» / «Пропустить».",
+            reply_markup=build_home_courts_kb(courts),
+        )
+        return
+
+    cid = name_to_id[text]
+    if cid in selected_ids:
+        selected_ids.remove(cid)
+        action = "убрал"
+    else:
+        selected_ids.append(cid)
+        action = "добавил"
+
+    await state.update_data(home_courts=selected_ids)
+
+    id_to_name = {c["id"]: c["short_name"] for c in courts}
+    if selected_ids:
+        chosen_names = [id_to_name.get(x, str(x)) for x in selected_ids]
+        selected_str = "Сейчас выбрано: " + ", ".join(chosen_names)
+    else:
+        selected_str = "Сейчас ничего не выбрано."
+
+    address = name_to_addr.get(text) or "Адрес не указан"
+
+    await message.answer(
+        f"Я {action} «{text}» в список домашних кортов.\n"
+        f"<i>Адрес: 📍 {address}</i>\n\n"
+        f"{selected_str}\n\n"
+        f"Можешь выбрать ещё или нажать «{HOME_DONE}», когда закончишь.",
+        reply_markup=build_home_courts_kb(courts),
+        parse_mode="HTML",
     )
 
 
@@ -852,8 +1080,6 @@ async def get_gender(message: Message, state: FSMContext):
         gender = "Мужчина"
     elif gender_raw.startswith("жен"):
         gender = "Женщина"
-    elif gender_raw.startswith("не"):
-        gender = "Не указывать"
     else:
         await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
         return
@@ -1134,6 +1360,14 @@ async def get_birth_date(message: Message, state: FSMContext):
         await message.answer(
             "Не похоже на дату 😅\n"
             "Нужен формат ДД.ММ.ГГГГ, например: 31.12.1990",
+        )
+        return
+
+    age = calculate_age_from_str(text)
+    if age is None or age < MIN_AGE or age > MAX_AGE:
+        await message.answer(
+            f"Этот сервис доступен только пользователям от {MIN_AGE} до {MAX_AGE} лет.\n"
+            "Проверь дату рождения и введи ещё раз.",
         )
         return
 
