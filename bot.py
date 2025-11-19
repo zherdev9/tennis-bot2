@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 
@@ -60,12 +61,12 @@ class Onboarding(StatesGroup):
     name = State()
     gender = State()
     city = State()
-    ntrp = State()              # базовый уровень по шкале NTRP
-    play_experience = State()   # играли ли в падел/теннис/сквош
-    matches_6m = State()        # сколько матчей за 6 месяцев
-    fitness = State()           # физподготовка
-    tournaments = State()       # турнирный опыт: Tour / Masters / не участвовал
-    birth_date = State()        # дата рождения
+    ntrp = State()
+    play_experience = State()
+    matches_6m = State()
+    fitness = State()
+    tournaments = State()
+    birth_date = State()
     about = State()
     photo = State()
 
@@ -75,7 +76,7 @@ class Onboarding(StatesGroup):
 
 gender_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Мужской"), KeyboardButton(text="Женский")],
+        [KeyboardButton(text="Мужчина"), KeyboardButton(text="Женщина")],
         [KeyboardButton(text="Не указывать")],
     ],
     resize_keyboard=True,
@@ -85,28 +86,40 @@ gender_kb = ReplyKeyboardMarkup(
 city_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Москва")],
-        [KeyboardButton(text="Другой город"), KeyboardButton(text="Пропустить")],
+        [KeyboardButton(text="Другой город")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
 
+# Кнопки NTRP с короткими описаниями
 ntrp_kb = ReplyKeyboardMarkup(
     keyboard=[
         [
-            KeyboardButton(text="1.0–1.5: только учусь попадать по мячу"),
-            KeyboardButton(text="2.0: держу мяч недолго, розыгрыши короткие"),
+            KeyboardButton(text="1.0 — полностью начинающий"),
+            KeyboardButton(text="1.5 — держу мяч, но нестабильно"),
         ],
         [
-            KeyboardButton(text="2.5: могу держать розыгрыш и задавать направление"),
-            KeyboardButton(text="3.0–3.5: контролирую направление и глубину мяча"),
+            KeyboardButton(text="2.0 — базовые удары, мало стабильности"),
+            KeyboardButton(text="2.5 — контролирую направление, короткие розыгрыши"),
         ],
         [
-            KeyboardButton(text="4.0–4.5: уверенно играю, меняю темп и глубину"),
-            KeyboardButton(text="5.0–5.5: сильный любитель, турниры и матчи"),
+            KeyboardButton(text="3.0 — стабильность в среднем темпе"),
+            KeyboardButton(text="3.5 — направление и глубина на хорошем уровне"),
         ],
         [
-            KeyboardButton(text="6.0–7.0: очень сильный, почти профи/профи"),
+            KeyboardButton(text="4.0 — уверенный темп, вариативность ударов"),
+            KeyboardButton(text="4.5 — сила, подкрутка, меняю тактику"),
+        ],
+        [
+            KeyboardButton(text="5.0 — уверенная глубина, сложные удары"),
+            KeyboardButton(text="5.5 — мощь и стабильность в быстром темпе"),
+        ],
+        [
+            KeyboardButton(text="6.0–7.0 — элитный/профессиональный уровень"),
+        ],
+        [
+            KeyboardButton(text="Ввести свой уровень (например: 3.25)"),
         ],
     ],
     resize_keyboard=True,
@@ -153,7 +166,8 @@ tournaments_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-skip_kb = ReplyKeyboardMarkup(
+# Только для вопроса "О себе"
+skip_about_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Пропустить")]],
     resize_keyboard=True,
     one_time_keyboard=True,
@@ -165,7 +179,6 @@ skip_kb = ReplyKeyboardMarkup(
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # users
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -174,8 +187,8 @@ async def init_db():
                 name TEXT,
                 gender TEXT,
                 city TEXT,
-                ntrp REAL,          -- итоговый рейтинг
-                ntrp_self REAL,     -- самооценка пользователя
+                ntrp REAL,
+                ntrp_self REAL,
                 play_experience TEXT,
                 matches_6m TEXT,
                 fitness TEXT,
@@ -189,7 +202,6 @@ async def init_db():
         )
         await _ensure_user_columns(db)
 
-        # courts
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS courts (
@@ -225,7 +237,6 @@ async def _ensure_user_columns(db: aiosqlite.Connection):
     await cursor.close()
     existing = {c[1] for c in cols}
 
-    # На случай, если таблица создавалась старой версией
     needed = {
         "username": "TEXT",
         "name": "TEXT",
@@ -279,20 +290,20 @@ async def get_user(tg_id: int):
 
 
 async def upsert_user(
-    tg_id: int,
-    username: str | None,
-    name: str | None,
-    gender: str | None,
-    city: str | None,
-    ntrp: float | None,
-    ntrp_self: float | None,
-    play_experience: str | None,
-    matches_6m: str | None,
-    fitness: str | None,
-    tournaments: str | None,
-    birth_date: str | None,
-    about: str | None,
-    photo_file_id: str | None,
+    tg_id,
+    username,
+    name,
+    gender,
+    city,
+    ntrp,
+    ntrp_self,
+    play_experience,
+    matches_6m,
+    fitness,
+    tournaments,
+    birth_date,
+    about,
+    photo_file_id,
 ):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -339,20 +350,29 @@ async def upsert_user(
         await db.commit()
 
 # -----------------------------------------
-# Логика пересчёта рейтинга
+# Логика NTRP и рейтинга
 # -----------------------------------------
 
-def parse_ntrp_from_button(text: str) -> float | None:
+def parse_ntrp_from_button(text: str):
+    """
+    Парсим NTRP из текста кнопки.
+    Ожидаем форматы типа:
+      '3.0 — ...'
+      '6.0–7.0 — ...' -> берём 6.0
+    """
     if not text:
         return None
-    head = text.split(":", 1)[0].strip()
+
+    head = text.split("—", 1)[0].strip()  # до длинного тире
     head = head.replace(" ", "")
+
     if "–" in head:
         part = head.split("–", 1)[0]
     elif "-" in head:
         part = head.split("-", 1)[0]
     else:
         part = head
+
     part = part.replace(",", ".")
     try:
         return float(part)
@@ -360,18 +380,22 @@ def parse_ntrp_from_button(text: str) -> float | None:
         return None
 
 
-def compute_final_ntrp(
-    base_ntrp: float,
-    play_experience: str | None,
-    matches_6m: str | None,
-    fitness: str | None,
-    tournaments: str | None,
-) -> float:
+def normalize_custom_ntrp(value: float) -> float:
     """
-    Простая модель:
-    - базовый рейтинг = выбор пользователя;
-    - модификаторы дают ±0.1–0.3 суммарно.
-    Пример: выбрал 3.0, играл в этом году и участвовал в Tour → рейтинг ~3.2–3.3.
+    Ограничиваем [1.0; 7.0] и округляем до двух знаков.
+    """
+    if value < 1.0:
+        value = 1.0
+    if value > 7.0:
+        value = 7.0
+    return round(value, 2)
+
+
+def compute_final_ntrp(base_ntrp, play_experience, matches_6m, fitness, tournaments):
+    """
+    Новая модель с уменьшенными модификаторами:
+    - Максимальный реальный прирост ≈ +0.75
+    - Без жёсткого "обрезания", только за счёт самих коэффициентов.
     """
     mod = 0.0
     pe = (play_experience or "").lower()
@@ -379,23 +403,23 @@ def compute_final_ntrp(
     fit = (fitness or "").lower()
     tour = (tournaments or "").lower()
 
-    # Опыт игры
+    # Опыт игры в теннис
     if "никогда" in pe:
-        mod -= 0.3
+        mod -= 0.25
     elif "в этом году" in pe:
-        mod += 0.1
+        mod += 0.10
     elif "более года" in pe:
         mod -= 0.05
     elif "более пяти" in pe:
         mod -= 0.15
 
-    # Кол-во матчей за 6 мес
+    # Матчи за 6 месяцев
     if "0–10" in m6 or "0-10" in m6:
         mod += 0.0
     elif "10–100" in m6 or "10-100" in m6:
         mod += 0.15
     elif "100" in m6:
-        mod += 0.3
+        mod += 0.25
 
     # Физподготовка
     if "низкая" in fit:
@@ -403,13 +427,13 @@ def compute_final_ntrp(
     elif "хорошая" in fit:
         mod += 0.0
     elif "отличная" in fit:
-        mod += 0.15
+        mod += 0.10
 
-    # Турниры
+    # Турнирный опыт
     if "tour" in tour:
         mod += 0.15
     elif "masters" in tour:
-        mod += 0.3
+        mod += 0.30
 
     final = base_ntrp + mod
     if final < 1.0:
@@ -417,7 +441,6 @@ def compute_final_ntrp(
     if final > 7.0:
         final = 7.0
 
-    # Округлим до сотых
     return round(final, 2)
 
 # -----------------------------------------
@@ -439,7 +462,7 @@ async def start_cmd(message: Message, state: FSMContext):
 
     await message.answer(
         "Привет 👋\nМеня зовут TennisBot.\n"
-        "Сейчас за минуту настроим твой профиль.\n\n"
+        "Сейчас за пару минут настроим твой теннисный профиль.\n\n"
         "Как тебя подписывать?",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -455,26 +478,29 @@ async def get_name(message: Message, state: FSMContext):
 
     await state.update_data(name=name)
 
-    await message.answer("Выбери пол:", reply_markup=gender_kb)
+    await message.answer("Выбери свой пол:", reply_markup=gender_kb)
     await state.set_state(Onboarding.gender)
 
 
 @dp.message(Onboarding.gender)
 async def get_gender(message: Message, state: FSMContext):
-    gender_raw = (message.text or "").lower()
-    if gender_raw.startswith("муж"):
-        gender = "male"
-    elif gender_raw.startswith("жен"):
-        gender = "female"
-    elif gender_raw.startswith("не"):
-        gender = None
+    text = (message.text or "").strip().lower()
+
+    if text.startswith("муж"):
+        gender = "Мужчина"
+    elif text.startswith("жен"):
+        gender = "Женщина"
+    elif text.startswith("не"):
+        gender = "Не указывать"
     else:
-        gender = "other"
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
 
     await state.update_data(gender=gender)
 
     await message.answer(
-        "В каком городе ты обычно играешь?\nПока основной фокус — Москва 😊",
+        "В каком городе ты обычно играешь?\n"
+        "Сейчас фокус на Москве, но можно указать и другой город.",
         reply_markup=city_kb,
     )
     await state.set_state(Onboarding.city)
@@ -482,23 +508,17 @@ async def get_gender(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.city)
 async def get_city(message: Message, state: FSMContext):
-    raw = (message.text or "").lower()
+    text = (message.text or "").strip()
 
-    if raw.startswith("моск"):
-        city = "Москва"
-    elif raw.startswith("друг"):
-        city = "Другой город"
-    elif raw.startswith("пропус"):
-        city = None
-    else:
-        city = message.text
+    if not text:
+        await message.answer("Город не может быть пустым, укажи хотя бы что-то 🙂")
+        return
 
-    await state.update_data(city=city)
+    await state.update_data(city=text)
 
     await message.answer(
         "Теперь выбери свой уровень по шкале NTRP.\n\n"
-        "Кнопки ниже с описанием навыков: как держишь розыгрыш, "
-        "направление и глубину мяча и т.д.",
+        "Кнопки ниже с короткими описаниями навыков.",
         reply_markup=ntrp_kb,
     )
     await state.set_state(Onboarding.ntrp)
@@ -506,30 +526,48 @@ async def get_city(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.ntrp)
 async def get_ntrp(message: Message, state: FSMContext):
-    raw = (message.text or "").strip()
-    base_ntrp = parse_ntrp_from_button(raw)
+    text = (message.text or "").strip()
 
-    if base_ntrp is None:
-        try:
-            base_ntrp = float(raw.replace(",", "."))
-        except ValueError:
-            await message.answer(
-                "Это не похоже на уровень NTRP 🤔\n"
-                "Выбери одну из кнопок или введи число от 1.0 до 7.0.",
-            )
-            return
+    data = await state.get_data()
+    waiting_custom = data.get("waiting_custom_ntrp", False)
 
-    if not (1.0 <= base_ntrp <= 7.0):
+    # Если только что нажали кнопку "Ввести свой уровень..."
+    if text.startswith("Ввести свой уровень"):
+        await state.update_data(waiting_custom_ntrp=True)
         await message.answer(
-            "Шкала NTRP от 1.0 до 7.0.\n"
-            "Попробуй ещё раз 🙂",
+            "Введи свой уровень NTRP числом от 1.00 до 7.00.\n"
+            "Например: 3.25",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    await state.update_data(ntrp_self=base_ntrp)
+    # Если ждём ручной ввод уровня
+    if waiting_custom:
+        raw = text.replace(",", ".")
+        try:
+            value = float(raw)
+        except ValueError:
+            await message.answer(
+                "Не удалось распознать число 🤔\n"
+                "Пример: 3.25",
+            )
+            return
+
+        value = normalize_custom_ntrp(value)
+        await state.update_data(ntrp_self=value, waiting_custom_ntrp=False)
+    else:
+        # Обычный выбор кнопки
+        base_ntrp = parse_ntrp_from_button(text)
+        if base_ntrp is None:
+            await message.answer(
+                "Выбери уровень по кнопке или нажми «Ввести свой уровень (например: 3.25)».",
+                reply_markup=ntrp_kb,
+            )
+            return
+        await state.update_data(ntrp_self=base_ntrp)
 
     await message.answer(
-        "Играешь ли ты в падел, теннис или сквош?",
+        "Играешь ли ты в большой теннис?",
         reply_markup=play_experience_kb,
     )
     await state.set_state(Onboarding.play_experience)
@@ -537,7 +575,18 @@ async def get_ntrp(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.play_experience)
 async def get_play_experience(message: Message, state: FSMContext):
-    await state.update_data(play_experience=message.text)
+    text = (message.text or "").strip()
+
+    if text not in [
+        "Нет, никогда",
+        "Да, в этом году",
+        "Да, более года назад",
+        "Да, более пяти лет назад",
+    ]:
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
+
+    await state.update_data(play_experience=text)
 
     await message.answer(
         "Сколько матчей ты сыграл за последние 6 месяцев?",
@@ -548,7 +597,17 @@ async def get_play_experience(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.matches_6m)
 async def get_matches_6m(message: Message, state: FSMContext):
-    await state.update_data(matches_6m=message.text)
+    text = (message.text or "").strip()
+
+    if text not in [
+        "0–10 матчей",
+        "10–100 матчей",
+        "100 и более",
+    ]:
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
+
+    await state.update_data(matches_6m=text)
 
     await message.answer(
         "Оцени свою общую физическую подготовку:",
@@ -559,12 +618,22 @@ async def get_matches_6m(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.fitness)
 async def get_fitness(message: Message, state: FSMContext):
-    await state.update_data(fitness=message.text)
+    text = (message.text or "").strip()
+
+    if text not in [
+        "Низкая",
+        "Хорошая",
+        "Отличная",
+    ]:
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
+
+    await state.update_data(fitness=text)
 
     await message.answer(
         "Участвовал ли ты в турнирах?\n\n"
-        "• Tour — массовые любительские турниры\n"
-        "• Masters — более высокий уровень\n",
+        "• Tour — любительские турниры\n"
+        "• Masters — более высокий уровень",
         reply_markup=tournaments_kb,
     )
     await state.set_state(Onboarding.tournaments)
@@ -572,12 +641,22 @@ async def get_fitness(message: Message, state: FSMContext):
 
 @dp.message(Onboarding.tournaments)
 async def get_tournaments(message: Message, state: FSMContext):
-    await state.update_data(tournaments=message.text)
+    text = (message.text or "").strip()
+
+    if text not in [
+        "Не участвовал",
+        "Tour",
+        "Masters",
+    ]:
+        await message.answer("Пожалуйста, выбери один из вариантов на клавиатуре 🙂")
+        return
+
+    await state.update_data(tournaments=text)
 
     await message.answer(
         "Укажи дату рождения в формате ДД.ММ.ГГГГ\n"
-        "Или нажми «Пропустить».",
-        reply_markup=skip_kb,
+        "Например: 31.12.1990",
+        reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(Onboarding.birth_date)
 
@@ -585,53 +664,55 @@ async def get_tournaments(message: Message, state: FSMContext):
 @dp.message(Onboarding.birth_date)
 async def get_birth_date(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if text.lower().startswith("пропус"):
-        birth_date = None
-    else:
-        birth_date = text  # пока просто храндим строкой, без валидации
-    await state.update_data(birth_date=birth_date)
+
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", text):
+        await message.answer(
+            "Не похоже на дату 😅\n"
+            "Нужен формат ДД.ММ.ГГГГ, например: 31.12.1990",
+        )
+        return
+
+    await state.update_data(birth_date=text)
 
     await message.answer(
         "Напиши немного о себе: как играешь и что ищешь.\n"
         "Или нажми «Пропустить».",
-        reply_markup=skip_kb,
+        reply_markup=skip_about_kb,
     )
     await state.set_state(Onboarding.about)
 
 
 @dp.message(Onboarding.about)
 async def get_about(message: Message, state: FSMContext):
-    about_raw = (message.text or "").strip().lower()
-    if about_raw.startswith("пропус"):
+    text = (message.text or "").strip()
+
+    if text.lower().startswith("пропус"):
         about = None
     else:
-        about = message.text
+        about = text
 
     await state.update_data(about=about)
 
     await message.answer(
         "Финальный штрих — добавь фото для профиля 📷\n\n"
-        "Отправь фото или нажми «Пропустить».",
-        reply_markup=skip_kb,
+        "Просто отправь фото.",
+        reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(Onboarding.photo)
 
 
 @dp.message(Onboarding.photo)
 async def get_photo(message: Message, state: FSMContext):
-    photo_file_id = None
-    if message.photo:
-        photo_file_id = message.photo[-1].file_id
-    else:
-        text = (message.text or "").lower()
-        if not text.startswith("пропус"):
-            await message.answer("Отправь фото или нажми «Пропустить» 🙂")
-            return
+    if not message.photo:
+        await message.answer("Пожалуйста, отправь именно фото 🙂")
+        return
+
+    photo_file_id = message.photo[-1].file_id
 
     data = await state.get_data()
     await state.clear()
 
-    base_ntrp = data.get("ntrp_self")  # float, мы сохраняли выше
+    base_ntrp = data.get("ntrp_self")
     play_experience = data.get("play_experience")
     matches_6m = data.get("matches_6m")
     fitness = data.get("fitness")
@@ -662,14 +743,12 @@ async def get_photo(message: Message, state: FSMContext):
         photo_file_id=photo_file_id,
     )
 
-    text = (
+    await message.answer(
         f"Профиль сохранён! 🎾\n\n"
         f"Твоя самооценка: {base_ntrp:.2f}\n"
-        f"Начальный рейтинг в боте (с учётом опыта и турниров): {final_ntrp:.2f}\n\n"
-        f"Посмотреть профиль → /me"
+        f"Начальный рейтинг в боте: {final_ntrp:.2f}\n\n"
+        f"Посмотреть профиль → /me",
     )
-
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
 
 # -----------------------------------------
 # Профиль
@@ -686,7 +765,7 @@ async def profile_cmd(message: Message):
     txt = (
         "📋 <b>Твой профиль</b>\n\n"
         f"Имя: {user['name']}\n"
-        f"Пол: {user['gender'] or 'не указан'}\n"
+        f"Пол: {user['gender'] or 'Не указывать'}\n"
         f"Город: {user['city'] or 'не указан'}\n"
         f"Самооценка NTRP: {user['ntrp_self'] or '—'}\n"
         f"Начальный рейтинг бота: {user['ntrp'] or '—'}\n"
@@ -714,6 +793,7 @@ async def profile_cmd(message: Message):
 async def handle_root(request):
     return web.Response(text="OK")
 
+
 async def start_web():
     app = web.Application()
     app.router.add_get("/", handle_root)
@@ -736,6 +816,7 @@ async def main():
         dp.start_polling(bot),
         start_web(),
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
