@@ -365,6 +365,7 @@ def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+
 def build_courts_single_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
     """
     Клавиатура для выбора одного корта (создание матча).
@@ -419,7 +420,7 @@ rating_limit_choice_kb = ReplyKeyboardMarkup(
 )
 
 # Значения рейтинга для диапазона (1.0, 1.5, ..., 7.0)
-rating_values = [f"{x / 2:.1f}".replace(".", ".") for x in range(2, 15)]  # 1.0..7.0
+rating_values = [f"{x / 2:.1f}" for x in range(2, 15)]  # 1.0..7.0
 
 def build_rating_kb() -> ReplyKeyboardMarkup:
     row = []
@@ -511,6 +512,9 @@ async def init_db():
             );
             """
         )
+        # старые записи могли иметь NULL — считаем их активными
+        await db.execute("UPDATE courts SET is_active = 1 WHERE is_active IS NULL;")
+        await seed_courts_if_empty(db)
 
         # games
         await db.execute(
@@ -548,6 +552,32 @@ async def init_db():
         )
 
         await db.commit()
+
+
+async def seed_courts_if_empty(db: aiosqlite.Connection):
+    """
+    Если таблица courts пустая – читаем courts_seed_big.sql и заполняем её.
+    """
+    cursor = await db.execute("SELECT COUNT(*) FROM courts;")
+    row = await cursor.fetchone()
+    await cursor.close()
+    count = row[0] if row is not None else 0
+
+    if count > 0:
+        return
+
+    sql_path = os.path.join(os.path.dirname(__file__), "courts_seed_big.sql")
+    try:
+        with open(sql_path, "r", encoding="utf-8") as f:
+            sql_script = f.read()
+        await db.executescript(sql_script)
+        logging.info("Courts seeded from courts_seed_big.sql")
+    except FileNotFoundError:
+        logging.warning(
+            "courts_seed_big.sql not found, courts table will stay empty."
+        )
+    except Exception as e:
+        logging.exception("Failed to seed courts from courts_seed_big.sql: %s", e)
 
 
 async def _ensure_user_columns(db: aiosqlite.Connection):
@@ -596,10 +626,20 @@ async def _ensure_games_columns(db: aiosqlite.Connection):
 
 
 async def get_active_courts() -> List[aiosqlite.Row]:
+    """
+    Возвращаем все «активные» корты.
+    Важно: старые записи могли иметь is_active = NULL,
+    поэтому считаем COALESCE(is_active, 1) = 1.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, short_name, address FROM courts WHERE is_active = 1 ORDER BY short_name;"
+            """
+            SELECT id, short_name, address
+            FROM courts
+            WHERE COALESCE(is_active, 1) = 1
+            ORDER BY short_name;
+            """
         )
         rows = await cursor.fetchall()
         await cursor.close()
@@ -1777,7 +1817,6 @@ async def newgame_date_choice(message: Message, state: FSMContext):
         )
         return
 
-    # Проверка ограничений (на всякий случай, хотя сегодня/завтра всегда ок)
     max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
     if match_date_obj < today:
         await message.answer(
@@ -1902,7 +1941,6 @@ async def newgame_rating_limit_choice(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
     if text == "Без ограничений":
-        # Сразу переходим к выбору количества игроков
         await state.update_data(rating_min=None, rating_max=None)
         await state.set_state(NewGame.players_count)
         await message.answer(
@@ -2101,7 +2139,6 @@ async def newgame_comment(message: Message, state: FSMContext):
 
     booking_text = "забронирован" if is_court_booked else "не забронирован"
     privacy_text = "приватный матч" if visibility == "private" else "публичный матч"
-
     comment_text = comment if comment else "—"
 
     txt = (
