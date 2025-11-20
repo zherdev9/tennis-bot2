@@ -1,4 +1,7 @@
 aiogram==2.25.1
 aiohttp==3.9.1
 yarl==1.9.4
-multi
+multidict==6.0.4
+frozenlist==1.4.1
+aiosqlite==0.19.0
+python-dotenv==1.0.1
