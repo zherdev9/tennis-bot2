@@ -427,6 +427,8 @@ date_choice_kb = ReplyKeyboardMarkup(
 def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
     """Клавиатура времени с шагом 30 минут.
     Для сегодняшней даты скрываются уже прошедшие слоты.
+    Если слотов нет (например, уже глубокая ночь) — вернём пустую клавиатуру,
+    а логика выше покажет сообщение, что на эту дату игру создать нельзя.
     """
     now = datetime.now()
     base = datetime(
@@ -454,19 +456,6 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
                 callback_data=f"newgame_time:{label}",
             )
         )
-
-    # если вдруг все слоты вырезали (например, уже поздняя ночь)
-    if not buttons:
-        buttons = []
-        for i in range(48):
-            slot_dt = base + timedelta(minutes=30 * i)
-            label = slot_dt.strftime("%H:%M")
-            buttons.append(
-                InlineKeyboardButton(
-                    text=label,
-                    callback_data=f"newgame_time:{label}",
-                )
-            )
 
     # Раскладываем кнопки по рядам по 4 в строке
     rows: list[list[InlineKeyboardButton]] = []
@@ -2227,11 +2216,30 @@ async def newgame_date_choice(message: Message, state: FSMContext):
     match_date_str = match_date_obj.strftime("%d.%m.%Y")
     await state.update_data(match_date=match_date_str)
 
+    # Генерируем клавиатуру времени
+    time_kb = generate_time_keyboard(match_date_obj)
+
+    # Если слотов нет (например, уже 23:42 и всё на сегодня прошло)
+    if not time_kb.inline_keyboard:
+        if match_date_obj == today:
+            await message.answer(
+                "На сегодня уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "Выбери другую дату.",
+                reply_markup=date_choice_kb,
+            )
+        else:
+            await message.answer(
+                "На выбранную дату уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "Выбери другую дату.",
+                reply_markup=date_choice_kb,
+            )
+        return
+
     await state.set_state(NewGame.time)
     await message.answer(
         f"Дата матча: {match_date_str}\n\n"
         "Выбери время начала матча ⏰",
-        reply_markup=generate_time_keyboard(match_date_obj),
+        reply_markup=time_kb,
     )
 
 
@@ -2276,11 +2284,30 @@ async def newgame_date_manual(message: Message, state: FSMContext):
     match_date_str = match_date_obj.strftime("%d.%m.%Y")
     await state.update_data(match_date=match_date_str)
 
+    # Генерируем клавиатуру времени
+    time_kb = generate_time_keyboard(match_date_obj)
+
+    # Если на эту дату не осталось свободных слотов
+    if not time_kb.inline_keyboard:
+        if match_date_obj == today:
+            text_msg = (
+                "На сегодня уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "Выбери другую дату."
+            )
+        else:
+            text_msg = (
+                "На выбранную дату уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "Выбери другую дату."
+            )
+
+        await message.answer(text_msg, reply_markup=date_choice_kb)
+        return
+
     await state.set_state(NewGame.time)
     await message.answer(
         f"Дата матча: {match_date_str}\n\n"
         "Выбери время начала матча ⏰",
-        reply_markup=generate_time_keyboard(match_date_obj),
+        reply_markup=time_kb,
     )
 
 
