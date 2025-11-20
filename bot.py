@@ -2173,8 +2173,7 @@ async def newgame_date_choice(message: Message, state: FSMContext):
     await state.set_state(NewGame.time)
     await message.answer(
         f"Дата матча: {match_date_str}\n\nВыберите время начала матча ⏰",
-        reply_markup=generate_time_keyboard(match_date_obj)
-    ),
+        reply_markup=generate_time_keyboard(match_date_obj),
     )
 
 
@@ -2222,8 +2221,7 @@ async def newgame_date_manual(message: Message, state: FSMContext):
     await state.set_state(NewGame.time)
     await message.answer(
         f"Дата матча: {match_date_str}\n\nВыберите время начала матча ⏰",
-        reply_markup=generate_time_keyboard(match_date_obj)
-    ),
+        reply_markup=generate_time_keyboard(match_date_obj),
     )
 
 
@@ -3476,3 +3474,51 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# ---------- Выбор времени матча кнопками (шаг 30 минут) ----------
+
+def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
+    """
+    Клавиатура времени с шагом 30 минут.
+    Для сегодняшней даты скрывает уже прошедшие слоты.
+    """
+    kb = InlineKeyboardMarkup(row_width=4)
+    now = datetime.now()
+    base_dt = datetime.combine(match_date_obj, time(0, 0))
+    buttons = []
+
+    for i in range(48):  # 24 часа * 2 слота в час
+        slot = base_dt + timedelta(minutes=30 * i)
+        # если дата сегодня — не показываем прошедшие слоты
+        if match_date_obj == now.date() and slot.time() <= now.time():
+            continue
+        label = slot.strftime("%H:%M")
+        buttons.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"time:{label}",
+            )
+        )
+
+    if not buttons:
+        return kb
+
+    kb.add(*buttons)
+    return kb
+
+
+@dp.callback_query(F.data.startswith("time:"))
+async def newgame_time_inline(callback: CallbackQuery, state: FSMContext):
+    """
+    Обработка выбора времени через инлайн-клавиатуру.
+    """
+    _, time_str = callback.data.split(":", 1)
+
+    await state.update_data(match_time=time_str)
+    await state.set_state(NewGame.game_type)
+
+    await callback.message.answer(
+        f"Время матча: {time_str}\n\nВыбери тип игры:",
+        reply_markup=game_type_kb,
+    )
+    await callback.answer()
