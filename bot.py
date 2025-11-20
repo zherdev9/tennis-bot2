@@ -86,6 +86,7 @@ class HelpState(StatesGroup):
 
 
 class NewGame(StatesGroup):
+    creator_mode = State()
     court = State()
     date_choice = State()
     date_manual = State()
@@ -423,6 +424,17 @@ date_choice_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+# Режим создания игры
+creator_mode_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Создаю игру для себя")],
+        [KeyboardButton(text="Создаю игру для других")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
 # Тип игры
 game_type_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -619,6 +631,7 @@ async def init_db():
                 comment TEXT,
                 is_court_booked INTEGER DEFAULT 0,
                 visibility TEXT DEFAULT 'public',
+                creator_mode TEXT DEFAULT 'self',
                 is_active INTEGER DEFAULT 1,
                 status TEXT DEFAULT 'scheduled',
                 score TEXT,
@@ -719,6 +732,7 @@ async def _ensure_games_columns(db: aiosqlite.Connection):
     needed = {
         "is_court_booked": "INTEGER DEFAULT 0",
         "visibility": "TEXT DEFAULT 'public'",
+        "creator_mode": "TEXT DEFAULT 'self'",
         "is_active": "INTEGER DEFAULT 1",
         "status": "TEXT DEFAULT 'scheduled'",
         "score": "TEXT",
@@ -900,6 +914,7 @@ async def create_game(
     comment: Optional[str],
     is_court_booked: bool,
     visibility: str,
+    creator_mode: str = "self",
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -908,9 +923,9 @@ async def create_game(
                 creator_id, court_id, match_date, match_time,
                 game_type, rating_min, rating_max,
                 players_count, comment,
-                is_court_booked, visibility, is_active, status
+                is_court_booked, visibility, creator_mode, is_active, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'scheduled');
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'scheduled');
             """,
             (
                 creator_id,
@@ -924,6 +939,7 @@ async def create_game(
                 comment,
                 1 if is_court_booked else 0,
                 visibility,
+                creator_mode,
             ),
         )
         cursor = await db.execute("SELECT last_insert_rowid();")
@@ -1994,9 +2010,46 @@ async def newgame_cmd(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await state.set_state(NewGame.court)
+    await state.set_state(NewGame.creator_mode)
     await message.answer(
         "Создаём новую игру 🎾\n\n"
+        "Кого ты записываешь на матч?",
+        reply_markup=creator_mode_kb,
+    )
+
+
+@dp.message(NewGame.creator_mode)
+async def newgame_creator_mode(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if text == "Создаю игру для себя":
+        mode = "self"
+    elif text == "Создаю игру для других":
+        mode = "others"
+    else:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов на клавиатуре 🙂",
+            reply_markup=creator_mode_kb,
+        )
+        return
+
+    await state.update_data(creator_mode=mode)
+    await state.set_state(NewGame.court)
+
+    courts = await get_active_courts()
+    if not courts:
+        await message.answer(
+            "В базе пока нет ни одного корта. Обратись к админу.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.clear()
+        return
+
+    await message.answer(
         "Выбери корт, на котором планируешь играть:",
         reply_markup=build_courts_single_kb(courts),
     )
@@ -2349,6 +2402,7 @@ async def newgame_comment(message: Message, state: FSMContext):
     players_count = data.get("players_count")
     is_court_booked = data.get("is_court_booked", False)
     visibility = data.get("visibility", "public")
+    creator_mode = data.get("creator_mode", "self")
 
     game_id = await create_game(
         creator_id=message.from_user.id,
@@ -2362,6 +2416,7 @@ async def newgame_comment(message: Message, state: FSMContext):
         comment=comment,
         is_court_booked=is_court_booked,
         visibility=visibility,
+        creator_mode=creator_mode,
     )
 
     court_row = await get_court_by_id(court_id)
