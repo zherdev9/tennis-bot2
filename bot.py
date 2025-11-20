@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 import aiosqlite
@@ -41,6 +41,13 @@ MAX_REALISTIC_AGE = 100
 
 # Ограничение на создание матчей: не в прошлом и не дальше чем на 3 месяца вперёд
 MAX_MATCH_DAYS_AHEAD = 90
+
+# Локальная временная зона для расчёта дат/времени матчей.
+# По умолчанию используем Москву (UTC+3), но можно переопределить
+# через переменную окружения LOCAL_TZ_OFFSET (в часах).
+LOCAL_TZ_OFFSET = int(os.getenv("LOCAL_TZ_OFFSET", "3"))
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
+
 
 # Кол-во матчей на страницу в /games
 GAMES_PAGE_SIZE = 10
@@ -119,6 +126,15 @@ class MyGames(StatesGroup):
 # Хелперы
 # -----------------------------------------
 
+
+def get_local_now() -> datetime:
+    """Текущее время в локальной (игровой) временной зоне."""
+    return datetime.now(LOCAL_TZ)
+
+def get_local_today() -> date:
+    """Текущая дата в локальной (игровой) временной зоне."""
+    return get_local_now().date()
+
 def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     """
     birth_date_str: 'ДД.ММ.ГГГГ'
@@ -132,7 +148,7 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     except ValueError:
         return None
 
-    today = date.today()
+    today = get_local_today()
     age = (
         today.year
         - dob.year
@@ -430,7 +446,7 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
     Если слотов нет (например, уже глубокая ночь) — вернём пустую клавиатуру,
     а логика выше покажет сообщение, что на эту дату игру создать нельзя.
     """
-    now = datetime.now()
+    now = get_local_now()
     base = datetime(
         year=match_date_obj.year,
         month=match_date_obj.month,
@@ -2176,7 +2192,7 @@ async def newgame_court(message: Message, state: FSMContext):
 async def newgame_date_choice(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
-    today = date.today()
+    today = get_local_today()
 
     if text == "Сегодня":
         match_date_obj = today
@@ -2264,7 +2280,7 @@ async def newgame_date_manual(message: Message, state: FSMContext):
         )
         return
 
-    today = date.today()
+    today = get_local_today()
     max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
 
     if match_date_obj < today:
@@ -2620,7 +2636,7 @@ async def games_cmd(message: Message, state: FSMContext):
 @dp.message(ViewGames.date_choice)
 async def games_date_choice(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    today = date.today()
+    today = get_local_today()
 
     if text == "Отмена":
         await state.clear()
