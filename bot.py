@@ -438,8 +438,10 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
         second=0,
         microsecond=0,
     )
+
     buttons: list[InlineKeyboardButton] = []
 
+    # Собираем список всех слотов
     for i in range(48):  # 24 часа * 2 слота по 30 минут
         slot_dt = base + timedelta(minutes=30 * i)
         # если это сегодня — не показываем прошедшие слоты
@@ -455,7 +457,7 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
 
     # если вдруг все слоты вырезали (например, уже поздняя ночь)
     if not buttons:
-        # просто не фильтруем по времени
+        buttons = []
         for i in range(48):
             slot_dt = base + timedelta(minutes=30 * i)
             label = slot_dt.strftime("%H:%M")
@@ -466,10 +468,18 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
                 )
             )
 
-    kb = InlineKeyboardMarkup(row_width=4)
-    kb.add(*buttons)
-    return kb
+    # Раскладываем кнопки по рядам по 4 в строке
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for btn in buttons:
+        row.append(btn)
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
 
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # Режим создания игры
 creator_mode_kb = ReplyKeyboardMarkup(
