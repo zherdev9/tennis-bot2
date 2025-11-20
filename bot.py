@@ -2172,10 +2172,9 @@ async def newgame_date_choice(message: Message, state: FSMContext):
 
     await state.set_state(NewGame.time)
     await message.answer(
-        f"Дата матча: {match_date_str}\n\n"
-        "Укажи время начала в формате ЧЧ:ММ\n"
-        "Например: 19:30",
-        reply_markup=ReplyKeyboardRemove(),
+        f"Дата матча: {match_date_str}\n\nВыберите время начала матча ⏰",
+        reply_markup=generate_time_keyboard(match_date_obj)
+    ),
     )
 
 
@@ -2222,10 +2221,9 @@ async def newgame_date_manual(message: Message, state: FSMContext):
 
     await state.set_state(NewGame.time)
     await message.answer(
-        f"Дата матча: {match_date_str}\n\n"
-        "Укажи время начала в формате ЧЧ:ММ\n"
-        "Например: 19:30",
-        reply_markup=ReplyKeyboardRemove(),
+        f"Дата матча: {match_date_str}\n\nВыберите время начала матча ⏰",
+        reply_markup=generate_time_keyboard(match_date_obj)
+    ),
     )
 
 
@@ -3478,27 +3476,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-from datetime import timedelta
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-def generate_time_keyboard(selected_date):
-    now = datetime.now()
-    base = datetime.combine(selected_date.date(), datetime.min.time())
-    buttons=[]
-    for i in range(48):
-        slot = base + timedelta(minutes=30*i)
-        if selected_date.date()==now.date() and slot.time()<=now.time():
-            continue
-        label=slot.strftime("%H:%M")
-        buttons.append(InlineKeyboardButton(text=label, callback_data=f"time:{label}"))
-    kb=InlineKeyboardMarkup(row_width=4)
-    kb.add(*buttons)
-    return kb
-
-@dp.callback_query(F.data.startswith("time:"))
-async def time_select(callback: CallbackQuery, state: FSMContext):
-    time_str = callback.data.split(":")[1]
-    await state.update_data(match_time=time_str)
-    await callback.message.edit_text(f"Время выбрано: {time_str}")
-    await callback.answer()
