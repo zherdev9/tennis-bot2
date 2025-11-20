@@ -2940,7 +2940,7 @@ async def _send_created_games_list(message: Message, user_id: int, status: str):
 
         txt = (
             f"🎾 <b>Матч #{g['id']}</b>\n\n"
-            f"Статус: {g['status']}\n"
+            f"Статус: {'запланирован' if g['status']=='scheduled' else 'завершён' if g['status']=='finished' else 'отменён'}\n"
             f"Дата: {g['match_date']}\n"
             f"Время: {g['match_time']}\n"
             f"Корт: {g['court_short_name']} — <i>📍 {addr}</i>\n"
