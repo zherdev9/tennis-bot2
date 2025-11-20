@@ -132,7 +132,7 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     except ValueError:
         return None
 
-    today = get_local_today()
+    today = date.today()
     age = (
         today.year
         - dob.year
@@ -424,25 +424,13 @@ date_choice_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-
-def get_local_now() -> datetime:
-    """Текущее время в московском часовом поясе (UTC+3).
-    Используется для логики «сегодня/завтра» при создании и фильтрации матчей.
-    """
-    return datetime.utcnow() + timedelta(hours=3)
-
-
-def get_local_today() -> date:
-    return get_local_now().date()
-
-
 def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
     """Клавиатура времени с шагом 30 минут.
     Для сегодняшней даты скрываются уже прошедшие слоты.
     Если слотов нет (например, уже глубокая ночь) — вернём пустую клавиатуру,
-    а логика выше покажет сообщение, что на эту дату игру создать нельзя.
+    а логика выше покажет сообщение, что на эту дату матч создать нельзя.
     """
-    now = get_local_now()
+    now = datetime.now()
     base = datetime(
         year=match_date_obj.year,
         month=match_date_obj.month,
@@ -485,8 +473,8 @@ def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
 # Режим создания игры
 creator_mode_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Создаю игру для себя")],
-        [KeyboardButton(text="Создаю игру для других")],
+        [KeyboardButton(text="Создаю матч для себя")],
+        [KeyboardButton(text="Создаю матч для других")],
         [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
@@ -1027,7 +1015,7 @@ async def get_game_by_id(game_id: int) -> Optional[aiosqlite.Row]:
 async def get_game_occupancy(game_id: int) -> tuple[int, int]:
     """
     Возвращает кортеж (занятых мест, всего мест) для матча.
-    Создатель матча учитывается как занявший одно место, если creator_mode = 'self'.
+    Организатор матча учитывается как занявший одно место, если creator_mode = 'self'.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -1157,38 +1145,35 @@ async def get_games_created_by_user(
 async def get_games_with_user_participation(user_id: int) -> List[aiosqlite.Row]:
     """
     Матчи, где пользователь участвует:
-    • матчи, где его заявка принята (game_applications.status = 'accepted')
-    • матчи, которые он сам создал "для себя" (creator_mode = 'self').
+    • есть принятая заявка на матч
+    • или он сам создал матч в режиме "Создаю матч для себя" (creator_mode = 'self')
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT DISTINCT
-                   g.*,
+            SELECT g.*,
                    c.short_name AS court_short_name,
-                   c.address  AS court_address,
-                   ga.status  AS application_status,
-                   u.name     AS creator_name,
-                   u.ntrp     AS creator_ntrp
+                   c.address AS court_address,
+                   ga.status AS application_status,
+                   u.name AS creator_name,
+                   u.ntrp AS creator_ntrp
             FROM games g
             JOIN courts c ON c.id = g.court_id
             LEFT JOIN game_applications ga
-              ON ga.game_id      = g.id
-             AND ga.status       = 'accepted'
+              ON ga.game_id = g.id
              AND ga.applicant_id = ?
+             AND ga.status = 'accepted'
             LEFT JOIN users u ON u.telegram_id = g.creator_id
-            WHERE g.is_active = 1
-              AND (
-                    ga.id IS NOT NULL                      -- принятая заявка
-                    OR (g.creator_id = ? AND g.creator_mode = 'self')  -- я создал "для себя"
-                  );
+            WHERE (ga.id IS NOT NULL)
+               OR (g.creator_id = ? AND g.creator_mode = 'self');
             """,
             (user_id, user_id),
         )
         rows = await cursor.fetchall()
         await cursor.close()
         return list(rows)
+
 
 # -----------------------------------------
 # Хэндлеры: старт, профиль, reset, edit, help, newgame, games, mygames
@@ -1208,7 +1193,7 @@ async def start_cmd(message: Message, state: FSMContext):
             "/me — показать мой профиль\n"
             "/edit — изменить профиль\n"
             "/reset — сбросить анкету и пройти заново\n"
-            "/newgame — создать новую игру\n"
+            "/newgame — создать новый матч\n"
             "/games — посмотреть доступные матчи\n"
             "/mygames — мои матчи\n"
             "/help — написать в поддержку",
@@ -2122,7 +2107,7 @@ async def newgame_cmd(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(NewGame.creator_mode)
     await message.answer(
-        "Создаём новую игру 🎾\n\n"
+        "Создаём новый матч 🎾\n\n"
         "Кого ты записываешь на матч?",
         reply_markup=creator_mode_kb,
     )
@@ -2136,9 +2121,9 @@ async def newgame_creator_mode(message: Message, state: FSMContext):
         await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
         return
 
-    if text == "Создаю игру для себя":
+    if text == "Создаю матч для себя":
         mode = "self"
-    elif text == "Создаю игру для других":
+    elif text == "Создаю матч для других":
         mode = "others"
     else:
         await message.answer(
@@ -2197,7 +2182,7 @@ async def newgame_court(message: Message, state: FSMContext):
 async def newgame_date_choice(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
-    today = get_local_today()
+    today = date.today()
 
     if text == "Сегодня":
         match_date_obj = today
@@ -2221,7 +2206,7 @@ async def newgame_date_choice(message: Message, state: FSMContext):
     max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
     if match_date_obj < today:
         await message.answer(
-            "Нельзя создать игру в прошлом.\n"
+            "Нельзя создать матч в прошлом.\n"
             "Выбери дату не раньше сегодняшнего дня.",
             reply_markup=date_choice_kb,
         )
@@ -2244,13 +2229,13 @@ async def newgame_date_choice(message: Message, state: FSMContext):
     if not time_kb.inline_keyboard:
         if match_date_obj == today:
             await message.answer(
-                "На сегодня уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "На сегодня уже нельзя создать матч — все временные слоты прошли.\n\n"
                 "Выбери другую дату.",
                 reply_markup=date_choice_kb,
             )
         else:
             await message.answer(
-                "На выбранную дату уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "На выбранную дату уже нельзя создать матч — все временные слоты прошли.\n\n"
                 "Выбери другую дату.",
                 reply_markup=date_choice_kb,
             )
@@ -2285,12 +2270,12 @@ async def newgame_date_manual(message: Message, state: FSMContext):
         )
         return
 
-    today = get_local_today()
+    today = date.today()
     max_date = today + timedelta(days=MAX_MATCH_DAYS_AHEAD)
 
     if match_date_obj < today:
         await message.answer(
-            "Нельзя создать игру в прошлом.\n"
+            "Нельзя создать матч в прошлом.\n"
             "Выбери дату не раньше сегодняшнего дня.",
         )
         return
@@ -2312,12 +2297,12 @@ async def newgame_date_manual(message: Message, state: FSMContext):
     if not time_kb.inline_keyboard:
         if match_date_obj == today:
             text_msg = (
-                "На сегодня уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "На сегодня уже нельзя создать матч — все временные слоты прошли.\n\n"
                 "Выбери другую дату."
             )
         else:
             text_msg = (
-                "На выбранную дату уже нельзя создать игру — все временные слоты прошли.\n\n"
+                "На выбранную дату уже нельзя создать матч — все временные слоты прошли.\n\n"
                 "Выбери другую дату."
             )
 
@@ -2384,7 +2369,7 @@ async def newgame_game_type(message: Message, state: FSMContext):
     await message.answer(
         "Нужно ли ограничение по рейтингу?\n\n"
         "Если да — дальше выберешь диапазон.\n"
-        "Если нет — игра будет доступна для любого уровня.",
+        "Если нет — матч будет доступен для любого уровня.",
         reply_markup=rating_limit_choice_kb,
     )
 
@@ -2598,7 +2583,7 @@ async def newgame_comment(message: Message, state: FSMContext):
     occupied, total = await get_game_occupancy(game_id)
 
     txt = (
-        "Игра создана ✅\n\n"
+        "Матч создан ✅\n\n"
         f"ID игры: {game_id}\n"
         f"Тип: {game_type}\n"
         f"Дата: {match_date}\n"
@@ -2641,7 +2626,7 @@ async def games_cmd(message: Message, state: FSMContext):
 @dp.message(ViewGames.date_choice)
 async def games_date_choice(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    today = get_local_today()
+    today = date.today()
 
     if text == "Отмена":
         await state.clear()
@@ -2822,7 +2807,7 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
 
         txt = (
             f"🎾 <b>Матч #{g['id']}</b>\n\n"
-            f"Создатель: {creator_line}\n"
+            f"Организатор: {creator_line}\n"
             f"Тип: {g['game_type']}\n"
             f"Дата: {g['match_date']}\n"
             f"Время: {g['match_time']}\n"
@@ -3002,12 +2987,20 @@ async def _send_created_games_list(message: Message, user_id: int, status: str):
 
 
 async def _send_my_participating_games(message: Message, user_id: int):
+    """
+    Раздел «Матчи с моим участием».
+
+    Показываем:
+    • матчи, куда у пользователя есть принятая заявка;
+    • а также матчи, которые он создал «для себя» (creator_mode = 'self').
+    """
     games = await get_games_with_user_participation(user_id)
     if not games:
-        await message.answer("У тебя пока нет матчей с принятыми заявками.")
+        await message.answer("У тебя пока нет матчей с принятыми заявками или созданных тобой матчей.")
         return
 
     for g in games:
+        # Ограничение по рейтингу
         if g["rating_min"] is not None and g["rating_max"] is not None:
             rating_text = f"{g['rating_min']:.2f}-{g['rating_max']:.2f}"
         else:
@@ -3018,6 +3011,7 @@ async def _send_my_participating_games(message: Message, user_id: int):
         addr = g["court_address"] or "Адрес не указан"
         occupied, total = await get_game_occupancy(g["id"])
         score_text = g["score"] or "—"
+
         creator_name = g["creator_name"] or "Игрок"
         creator_ntrp = g["creator_ntrp"]
         if creator_ntrp is not None:
@@ -3025,10 +3019,16 @@ async def _send_my_participating_games(message: Message, user_id: int):
         else:
             creator_line = creator_name
 
+        is_creator = g["creator_id"] == user_id
+        if is_creator:
+            participation_line = "Ты организатор этого матча"
+        else:
+            participation_line = "Твоё участие: заявка принята ✅"
+
         txt = (
             f"🎾 <b>Матч #{g['id']}</b>\n\n"
-            f"Твоё участие: заявка принята ✅\n"
-            f"Создатель: {creator_line}\n"
+            f"{participation_line}\n"
+            f"Организатор: {creator_line}\n"
             f"Статус матча: {g['status']}\n"
             f"Дата: {g['match_date']}\n"
             f"Время: {g['match_time']}\n"
@@ -3317,7 +3317,7 @@ async def app_decision_callback(callback: CallbackQuery):
         status = app_row["status"]
 
         if callback.from_user.id != creator_id:
-            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            await callback.answer("Ты не организатор этого матча.", show_alert=True)
             return
 
         if status != "pending":
@@ -3384,7 +3384,7 @@ async def cancel_game_callback(callback: CallbackQuery):
             return
 
         if row["creator_id"] != callback.from_user.id:
-            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            await callback.answer("Ты не организатор этого матча.", show_alert=True)
             return
 
         if row["status"] == "cancelled":
@@ -3437,7 +3437,7 @@ async def view_apps_callback(callback: CallbackQuery):
             return
 
         if game_row["creator_id"] != callback.from_user.id:
-            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            await callback.answer("Ты не организатор этого матча.", show_alert=True)
             return
 
         cursor = await db.execute(
@@ -3510,7 +3510,7 @@ async def set_score_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     if game_row["creator_id"] != callback.from_user.id:
-        await callback.answer("Ты не создатель этого матча.", show_alert=True)
+        await callback.answer("Ты не организатор этого матча.", show_alert=True)
         return
 
     # По ТЗ — ввод счёта для завершённых матчей
