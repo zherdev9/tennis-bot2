@@ -108,6 +108,12 @@ class ViewGames(StatesGroup):
     home_courts_filter = State()
     browsing = State()
 
+
+class MyGames(StatesGroup):
+    main = State()
+    created_menu = State()
+    waiting_score = State()
+
 # -----------------------------------------
 # Хелперы
 # -----------------------------------------
@@ -117,6 +123,8 @@ def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     birth_date_str: 'ДД.ММ.ГГГГ'
     Возвращает возраст в полных годах или None, если дата некорректна.
     """
+    if not birth_date_str:
+        return None
     try:
         day, month, year = map(int, birth_date_str.split("."))
         dob = date(year, month, day)
@@ -525,6 +533,28 @@ games_browse_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+# ----- Клавиатуры для /mygames -----
+
+my_games_main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Созданные мной")],
+        [KeyboardButton(text="Матчи с моим участием")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+my_games_created_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Предстоящие матчи")],
+        [KeyboardButton(text="Завершённые матчи")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
 # -----------------------------------------
 # База данных
 # -----------------------------------------
@@ -590,6 +620,8 @@ async def init_db():
                 is_court_booked INTEGER DEFAULT 0,
                 visibility TEXT DEFAULT 'public',
                 is_active INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'scheduled',
+                score TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -688,6 +720,8 @@ async def _ensure_games_columns(db: aiosqlite.Connection):
         "is_court_booked": "INTEGER DEFAULT 0",
         "visibility": "TEXT DEFAULT 'public'",
         "is_active": "INTEGER DEFAULT 1",
+        "status": "TEXT DEFAULT 'scheduled'",
+        "score": "TEXT",
     }
 
     for col, coltype in needed.items():
@@ -874,9 +908,9 @@ async def create_game(
                 creator_id, court_id, match_date, match_time,
                 game_type, rating_min, rating_max,
                 players_count, comment,
-                is_court_booked, visibility, is_active
+                is_court_booked, visibility, is_active, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'scheduled');
             """,
             (
                 creator_id,
@@ -925,7 +959,7 @@ async def get_games_for_listing(
     offset: int,
 ) -> List[aiosqlite.Row]:
     """
-    Список публичных активных матчей с учётом фильтров.
+    Список публичных активных предстоящих матчей с учётом фильтров.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -941,6 +975,7 @@ async def get_games_for_listing(
             LEFT JOIN users u ON u.telegram_id = g.creator_id
             WHERE g.is_active = 1
               AND g.visibility = 'public'
+              AND g.status = 'scheduled'
         """
 
         if filter_date:
@@ -972,8 +1007,65 @@ async def get_games_for_listing(
         await cursor.close()
         return list(rows)
 
+
+async def get_games_created_by_user(
+    creator_id: int,
+    status: Optional[str] = None,
+) -> List[aiosqlite.Row]:
+    """
+    Матчи, созданные пользователем.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        params: List = [creator_id]
+        sql = """
+            SELECT g.*,
+                   c.short_name AS court_short_name,
+                   c.address AS court_address
+            FROM games g
+            JOIN courts c ON c.id = g.court_id
+            WHERE g.creator_id = ?
+        """
+        if status:
+            sql += " AND g.status = ?"
+            params.append(status)
+
+        sql += " ORDER BY g.match_date DESC, g.match_time DESC;"
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+
+async def get_games_with_user_participation(user_id: int) -> List[aiosqlite.Row]:
+    """
+    Матчи, где пользователь участвует (заявка принята).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT g.*,
+                   c.short_name AS court_short_name,
+                   c.address AS court_address,
+                   ga.status AS application_status,
+                   u.name AS creator_name,
+                   u.ntrp AS creator_ntrp
+            FROM game_applications ga
+            JOIN games g ON g.id = ga.game_id
+            JOIN courts c ON c.id = g.court_id
+            LEFT JOIN users u ON u.telegram_id = g.creator_id
+            WHERE ga.applicant_id = ?
+              AND ga.status = 'accepted';
+            """,
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
 # -----------------------------------------
-# Хэндлеры: старт, профиль, reset, edit, help, newgame, games
+# Хэндлеры: старт, профиль, reset, edit, help, newgame, games, mygames
 # -----------------------------------------
 
 @dp.message(CommandStart())
@@ -992,6 +1084,7 @@ async def start_cmd(message: Message, state: FSMContext):
             "/reset — сбросить анкету и пройти заново\n"
             "/newgame — создать новую игру\n"
             "/games — посмотреть доступные матчи\n"
+            "/mygames — мои матчи\n"
             "/help — написать в поддержку",
         )
         return
@@ -2612,6 +2705,280 @@ async def games_browsing(message: Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove(),
     )
 
+# -----------------------------------------
+# Мои матчи: /mygames
+# -----------------------------------------
+
+async def _send_created_games_list(message: Message, user_id: int, status: str):
+    """
+    Используется в разделе «Созданные мной»:
+    статус 'scheduled' — предстоящие, 'finished' — завершённые.
+    """
+    games = await get_games_created_by_user(user_id, status=status)
+    if not games:
+        if status == "scheduled":
+            await message.answer("У тебя пока нет предстоящих матчей.")
+        else:
+            await message.answer("У тебя пока нет завершённых матчей.")
+        return
+
+    for g in games:
+        if g["rating_min"] is not None and g["rating_max"] is not None:
+            rating_text = f"{g['rating_min']:.2f}-{g['rating_max']:.2f}"
+        else:
+            rating_text = "Без ограничений"
+
+        booking_text = "забронирован" if g["is_court_booked"] else "не забронирован"
+        comment_text = g["comment"] if g["comment"] else "—"
+        addr = g["court_address"] or "Адрес не указан"
+        score_text = g["score"] or "—"
+
+        txt = (
+            f"🎾 <b>Матч #{g['id']}</b>\n\n"
+            f"Статус: {g['status']}\n"
+            f"Дата: {g['match_date']}\n"
+            f"Время: {g['match_time']}\n"
+            f"Корт: {g['court_short_name']} — <i>📍 {addr}</i>\n"
+            f"Игроков: {g['players_count']}\n"
+            f"Ограничение по рейтингу: {rating_text}\n"
+            f"Бронь корта: {booking_text}\n"
+            f"Комментарий: {comment_text}\n"
+            f"Счёт: {score_text}"
+        )
+
+        if status == "scheduled":
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="👀 Откликнувшиеся",
+                            callback_data=f"view_apps:{g['id']}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Отменить матч",
+                            callback_data=f"cancel_game:{g['id']}",
+                        )
+                    ],
+                ]
+            )
+            await message.answer(txt, parse_mode="HTML", reply_markup=kb)
+        else:  # finished
+            if not g["score"]:
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Внести счёт",
+                                callback_data=f"set_score:{g['id']}",
+                            )
+                        ]
+                    ]
+                )
+                await message.answer(txt, parse_mode="HTML", reply_markup=kb)
+            else:
+                await message.answer(txt, parse_mode="HTML")
+
+
+async def _send_my_participating_games(message: Message, user_id: int):
+    games = await get_games_with_user_participation(user_id)
+    if not games:
+        await message.answer("У тебя пока нет матчей с принятыми заявками.")
+        return
+
+    for g in games:
+        if g["rating_min"] is not None and g["rating_max"] is not None:
+            rating_text = f"{g['rating_min']:.2f}-{g['rating_max']:.2f}"
+        else:
+            rating_text = "Без ограничений"
+
+        booking_text = "забронирован" if g["is_court_booked"] else "не забронирован"
+        comment_text = g["comment"] if g["comment"] else "—"
+        addr = g["court_address"] or "Адрес не указан"
+        score_text = g["score"] or "—"
+        creator_name = g["creator_name"] or "Игрок"
+        creator_ntrp = g["creator_ntrp"]
+        if creator_ntrp is not None:
+            creator_line = f"{creator_name} (NTRP {creator_ntrp:.2f})"
+        else:
+            creator_line = creator_name
+
+        txt = (
+            f"🎾 <b>Матч #{g['id']}</b>\n\n"
+            f"Твоё участие: заявка принята ✅\n"
+            f"Создатель: {creator_line}\n"
+            f"Статус матча: {g['status']}\n"
+            f"Дата: {g['match_date']}\n"
+            f"Время: {g['match_time']}\n"
+            f"Корт: {g['court_short_name']} — <i>📍 {addr}</i>\n"
+            f"Игроков: {g['players_count']}\n"
+            f"Ограничение по рейтингу: {rating_text}\n"
+            f"Бронь корта: {booking_text}\n"
+            f"Комментарий: {comment_text}\n"
+            f"Счёт: {score_text}"
+        )
+
+        await message.answer(txt, parse_mode="HTML")
+
+
+@dp.message(F.text == "/mygames")
+async def mygames_cmd(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "Сначала нужно заполнить профиль.\n"
+            "Пройди онбординг через /start 🙂"
+        )
+        return
+
+    await state.clear()
+    await state.set_state(MyGames.main)
+    await message.answer(
+        "Раздел «Мои матчи».\n"
+        "Выбери, что показать:",
+        reply_markup=my_games_main_kb,
+    )
+
+
+@dp.message(MyGames.main)
+async def mygames_main_handler(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Созданные мной":
+        await state.set_state(MyGames.created_menu)
+        await message.answer(
+            "Созданные тобой матчи.\nВыбери:",
+            reply_markup=my_games_created_kb,
+        )
+    elif text == "Матчи с моим участием":
+        await _send_my_participating_games(message, message.from_user.id)
+        # остаёмся в этом же меню
+        await message.answer(
+            "Выбери действие:",
+            reply_markup=my_games_main_kb,
+        )
+    elif text == "Отмена":
+        await state.clear()
+        await message.answer(
+            "Выход из раздела «Мои матчи».",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer(
+            "Пожалуйста, выбери вариант на клавиатуре.",
+            reply_markup=my_games_main_kb,
+        )
+
+
+@dp.message(MyGames.created_menu)
+async def mygames_created_menu_handler(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Предстоящие матчи":
+        await _send_created_games_list(message, message.from_user.id, status="scheduled")
+    elif text == "Завершённые матчи":
+        await _send_created_games_list(message, message.from_user.id, status="finished")
+    elif text == "Назад":
+        await state.set_state(MyGames.main)
+        await message.answer(
+            "Раздел «Мои матчи».",
+            reply_markup=my_games_main_kb,
+        )
+        return
+    else:
+        await message.answer(
+            "Пожалуйста, выбери вариант на клавиатуре.",
+            reply_markup=my_games_created_kb,
+        )
+
+# ---------- Заявка на матч: helper для карточки ----------
+
+async def send_application_card_to_creator(
+    creator_chat_id: int,
+    application_id: int,
+    game_id: int,
+    applicant_user: Optional[aiosqlite.Row],
+):
+    """
+    Показываем карточку игрока при новой заявке или при просмотре откликнувшихся.
+    """
+    if not applicant_user:
+        # fallback – просто текст
+        txt = (
+            f"📨 Новая заявка на матч #{game_id}\n"
+            f"ID заявки: {application_id}\n"
+            f"Информация об игроке недоступна."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Принять",
+                        callback_data=f"app_decision:{application_id}:accept",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"app_decision:{application_id}:reject",
+                    ),
+                ]
+            ]
+        )
+        await bot.send_message(creator_chat_id, txt, reply_markup=kb)
+        return
+
+    name = applicant_user["name"] or "—"
+    gender = applicant_user["gender"] or "—"
+    city = applicant_user["city"] or "—"
+    ntrp = applicant_user["ntrp"]
+    ntrp_text = f"{ntrp:.2f}" if ntrp is not None else "—"
+    about = applicant_user["about"] or "—"
+    birth_date_str = applicant_user["birth_date"]
+    age = calculate_age_from_str(birth_date_str)
+    age_text = f"{age} лет" if age is not None else "—"
+    photo_file_id = applicant_user["photo_file_id"]
+
+    txt = (
+        f"📇 <b>Заявка на матч #{game_id}</b>\n\n"
+        f"Имя: {name}\n"
+        f"Пол: {gender}\n"
+        f"Город: {city}\n"
+        f"Рейтинг: {ntrp_text}\n"
+        f"Возраст: {age_text}\n"
+        f"О себе: {about}\n"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Принять",
+                    callback_data=f"app_decision:{application_id}:accept",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"app_decision:{application_id}:reject",
+                ),
+            ]
+        ]
+    )
+
+    if photo_file_id:
+        await bot.send_photo(
+            creator_chat_id,
+            photo=photo_file_id,
+            caption=txt,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    else:
+        await bot.send_message(
+            creator_chat_id,
+            txt,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+
 # ---------- Заявка на матч: callback-кнопка ----------
 
 @dp.callback_query(F.data.startswith("apply_game:"))
@@ -2669,19 +3036,302 @@ async def apply_game_callback(callback: CallbackQuery):
             """,
             (game_id, callback.from_user.id),
         )
+        cursor = await db.execute("SELECT last_insert_rowid();")
+        row = await cursor.fetchone()
+        await cursor.close()
+        application_id = row[0]
         await db.commit()
 
-    # Попробуем уведомить создателя матча
+    # Пытаемся получить профиль игрока
+    applicant_user = await get_user(callback.from_user.id)
+
+    # Показываем карточку игрока создателю матча
     try:
-        username = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
-        await bot.send_message(
-            game["creator_id"],
-            f"📨 Новая заявка на матч #{game_id} от {username}",
+        await send_application_card_to_creator(
+            creator_chat_id=game["creator_id"],
+            application_id=application_id,
+            game_id=game_id,
+            applicant_user=applicant_user,
         )
     except Exception as e:
-        logger.exception("Failed to notify game creator: %s", e)
+        logger.exception("Failed to notify game creator with card: %s", e)
 
     await callback.answer("Заявка отправлена создателю матча ✅", show_alert=True)
+
+# ---------- Обработка решений по заявке (принять/отклонить) ----------
+
+@dp.callback_query(F.data.startswith("app_decision:"))
+async def app_decision_callback(callback: CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, app_id_str, action = data.split(":", 2)
+        application_id = int(app_id_str)
+        assert action in ("accept", "reject")
+    except Exception:
+        await callback.answer("Некорректные данные заявки.", show_alert=False)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            """
+            SELECT ga.*, g.creator_id, g.id AS game_id
+            FROM game_applications ga
+            JOIN games g ON g.id = ga.game_id
+            WHERE ga.id = ?;
+            """,
+            (application_id,),
+        )
+        app_row = await cursor.fetchone()
+        await cursor.close()
+
+        if not app_row:
+            await callback.answer("Заявка не найдена.", show_alert=True)
+            return
+
+        creator_id = app_row["creator_id"]
+        game_id = app_row["game_id"]
+        applicant_id = app_row["applicant_id"]
+        status = app_row["status"]
+
+        if callback.from_user.id != creator_id:
+            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            return
+
+        if status != "pending":
+            await callback.answer(
+                f"Заявка уже обработана (статус: {status}).",
+                show_alert=True,
+            )
+            return
+
+        new_status = "accepted" if action == "accept" else "rejected"
+        await db.execute(
+            "UPDATE game_applications SET status = ? WHERE id = ?;",
+            (new_status, application_id),
+        )
+        await db.commit()
+
+    # Уведомляем игрока
+    try:
+        if new_status == "accepted":
+            await bot.send_message(
+                applicant_id,
+                f"✅ Твою заявку на матч #{game_id} приняли!",
+            )
+            await callback.message.reply(
+                f"Заявка принята ✅\nМатч #{game_id}.\n"
+                "Можешь связаться с игроком через его профиль / username.",
+            )
+        else:
+            await bot.send_message(
+                applicant_id,
+                f"❌ Твою заявку на матч #{game_id} отклонили.",
+            )
+            await callback.message.reply(
+                f"Заявка отклонена ❌ (матч #{game_id}).",
+            )
+    except Exception as e:
+        logger.exception("Failed to notify about application decision: %s", e)
+
+    await callback.answer("Решение по заявке сохранено.", show_alert=False)
+
+# ---------- Отмена матча ----------
+
+@dp.callback_query(F.data.startswith("cancel_game:"))
+async def cancel_game_callback(callback: CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, game_id_str = data.split(":", 1)
+        game_id = int(game_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID матча.", show_alert=False)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, что создатель — текущий пользователь
+        cursor = await db.execute(
+            "SELECT creator_id, status FROM games WHERE id = ?;",
+            (game_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        if not row:
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+
+        if row["creator_id"] != callback.from_user.id:
+            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            return
+
+        if row["status"] == "cancelled":
+            await callback.answer("Матч уже отменён.", show_alert=True)
+            return
+
+        await db.execute(
+            "UPDATE games SET status = 'cancelled', is_active = 0 WHERE id = ?;",
+            (game_id,),
+        )
+        # Обновим статусы заявок
+        await db.execute(
+            """
+            UPDATE game_applications
+            SET status = 'cancelled'
+            WHERE game_id = ? AND status = 'pending';
+            """,
+            (game_id,),
+        )
+        await db.commit()
+
+    await callback.answer("Матч отменён.", show_alert=False)
+    await callback.message.reply(f"Матч #{game_id} отменён ❌")
+
+# ---------- Просмотр откликнувшихся ----------
+
+@dp.callback_query(F.data.startswith("view_apps:"))
+async def view_apps_callback(callback: CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, game_id_str = data.split(":", 1)
+        game_id = int(game_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID матча.", show_alert=False)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Проверяем, что юзер — создатель матча
+        cursor = await db.execute(
+            "SELECT creator_id FROM games WHERE id = ?;",
+            (game_id,),
+        )
+        game_row = await cursor.fetchone()
+        await cursor.close()
+
+        if not game_row:
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+
+        if game_row["creator_id"] != callback.from_user.id:
+            await callback.answer("Ты не создатель этого матча.", show_alert=True)
+            return
+
+        cursor = await db.execute(
+            """
+            SELECT ga.*, u.*
+            FROM game_applications ga
+            LEFT JOIN users u ON u.telegram_id = ga.applicant_id
+            WHERE ga.game_id = ?
+            ORDER BY ga.created_at ASC;
+            """,
+            (game_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    if not rows:
+        await callback.message.reply("На этот матч пока нет откликнувшихся.")
+        await callback.answer()
+        return
+
+    # Показываем карточки для всех, у кого статус pending
+    pending_shown = False
+    for r in rows:
+        app_status = r["status"]
+        if app_status == "pending":
+            pending_shown = True
+            application_id = r["id"]
+            # user-поля начинаются после столбцов ga; проще получить user отдельно
+            # но мы уже джоинили, поэтому сделаем маленький хак:
+            # В таблице users у нас точно есть telegram_id, возьмём его и ещё раз запросим
+            applicant_id = r["applicant_id"]
+            applicant_user = await get_user(applicant_id)
+            await send_application_card_to_creator(
+                creator_chat_id=callback.from_user.id,
+                application_id=application_id,
+                game_id=game_id,
+                applicant_user=applicant_user,
+            )
+
+    if not pending_shown:
+        await callback.message.reply(
+            "Все заявки на этот матч уже обработаны (приняты или отклонены)."
+        )
+
+    await callback.answer()
+
+# ---------- Ввод счёта для завершённого матча ----------
+
+@dp.callback_query(F.data.startswith("set_score:"))
+async def set_score_callback(callback: CallbackQuery, state: FSMContext):
+    data = callback.data or ""
+    try:
+        _, game_id_str = data.split(":", 1)
+        game_id = int(game_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID матча.", show_alert=False)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT creator_id, status FROM games WHERE id = ?;",
+            (game_id,),
+        )
+        game_row = await cursor.fetchone()
+        await cursor.close()
+
+    if not game_row:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    if game_row["creator_id"] != callback.from_user.id:
+        await callback.answer("Ты не создатель этого матча.", show_alert=True)
+        return
+
+    # По ТЗ — ввод счёта для завершённых матчей
+    # Но не будем жёстко проверять статус; если хочешь – можно ужесточить.
+    await state.set_state(MyGames.waiting_score)
+    await state.update_data(score_game_id=game_id)
+
+    await callback.answer()
+    await bot.send_message(
+        callback.from_user.id,
+        f"Введи счёт матча #{game_id} в свободной форме (например: 6-4 3-6 10-7):",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(MyGames.waiting_score)
+async def mygames_waiting_score_handler(message: Message, state: FSMContext):
+    score_text = (message.text or "").strip()
+    data = await state.get_data()
+    game_id = data.get("score_game_id")
+
+    if not game_id:
+        await state.clear()
+        await message.answer(
+            "Не нашёл ID матча для сохранения счёта. Попробуй ещё раз из меню.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE games SET score = ?, status = 'finished' WHERE id = ? AND creator_id = ?;",
+            (score_text, game_id, message.from_user.id),
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(
+        f"Счёт матча #{game_id} сохранён ✅\n\n"
+        f"Счёт: {score_text}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 # -----------------------------------------
 # HTTP-сервер для Render (healthcheck)
