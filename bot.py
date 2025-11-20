@@ -1072,6 +1072,51 @@ async def get_game_occupancy(game_id: int) -> tuple[int, int]:
         return occupied, players_count
 
 
+async def get_game_participant_ids(game_id: int, include_creator: bool = True) -> List[int]:
+    """
+    Возвращает список Telegram ID участников матча.
+    Участники = все принятые заявки + организатор (если он играет сам).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(
+            "SELECT creator_id, creator_mode FROM games WHERE id = ?;",
+            (game_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        if not row:
+            return []
+
+        creator_id = row["creator_id"]
+        creator_mode = row["creator_mode"]
+
+        participant_ids = set()
+
+        # Организатор считается участником, только если он создавал матч «для себя»
+        if include_creator and creator_mode == "self":
+            participant_ids.add(creator_id)
+
+        # Все принятые заявки
+        cursor = await db.execute(
+            """
+            SELECT applicant_id
+            FROM game_applications
+            WHERE game_id = ? AND status = 'accepted';
+            """,
+            (game_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        for r in rows:
+            participant_ids.add(r["applicant_id"])
+
+        return list(participant_ids)
+
+
 async def get_games_for_listing(
     user_id: int,
     filter_date: Optional[str],
@@ -3334,7 +3379,7 @@ async def app_decision_callback(callback: CallbackQuery):
         status = app_row["status"]
 
         if callback.from_user.id != creator_id:
-            await callback.answer("Ты не организатор этого матча.", show_alert=True)
+            await callback.answer("Вы не организатор этого матча.", show_alert=True)
             return
 
         if status != "pending":
@@ -3351,31 +3396,111 @@ async def app_decision_callback(callback: CallbackQuery):
         )
         await db.commit()
 
-    # Уведомляем игрока
-    try:
-        if new_status == "accepted":
+    # Если заявка отклонена — просто уведомляем игрока и организатора
+    if new_status == "rejected":
+        try:
             await bot.send_message(
                 applicant_id,
-                f"✅ Твою заявку на матч #{game_id} приняли!",
-            )
-            await callback.message.reply(
-                f"Заявка принята ✅\nМатч #{game_id}.\n"
-                "Можешь связаться с игроком через его профиль / username.",
-            )
-        else:
-            await bot.send_message(
-                applicant_id,
-                f"❌ Твою заявку на матч #{game_id} отклонили.",
+                f"❌ Увы, ваше участие в матче #{game_id} отклонено организатором.",
             )
             await callback.message.reply(
                 f"Заявка отклонена ❌ (матч #{game_id}).",
             )
+        except Exception as e:
+            logger.exception("Failed to notify about application decision: %s", e)
+
+        await callback.answer("Решение по заявке сохранено.", show_alert=False)
+        return
+
+    # Дальше — логика для принятой заявки
+    # Собираем список всех участников матча после принятия заявки
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+
+    # Словарь профилей участников
+    users_by_id = {}
+    for pid in participant_ids:
+        u = await get_user(pid)
+        if u:
+            users_by_id[pid] = u
+
+    def format_contact(u) -> str:
+        if not u:
+            return "Игрок (профиль недоступен)"
+        username = u["username"]
+        name = u["name"] or "Игрок"
+        if username:
+            return f"@{username}"
+        return name
+
+    def build_contacts_for(recipient_id: int) -> str:
+        contacts = []
+        for pid in participant_ids:
+            if pid == recipient_id:
+                continue
+            u = users_by_id.get(pid)
+            if not u:
+                continue
+            contacts.append(format_contact(u))
+        if not contacts:
+            return "Пока нет других участников с указанным Telegram-ником."
+        return "\n".join(f"• {c}" for c in contacts)
+
+    # Текущая заполняемость матча
+    occupied, total = await get_game_occupancy(game_id)
+
+    # 1) Сообщение организатору
+    try:
+        new_player_user = users_by_id.get(applicant_id)
+        new_player_contact = format_contact(new_player_user)
+
+        text_creator_lines = [
+            f"Ура! Вы приняли нового участника матча #{game_id} ✅",
+            f"Теперь вы можете написать ему {new_player_contact} и обсудить детали матча.",
+        ]
+        if occupied >= total:
+            text_creator_lines.append(
+                f"Теперь ваш матч полностью укомплектован: {occupied} из {total} участников."
+            )
+        else:
+            text_creator_lines.append(
+                f"Сейчас в матче {occupied} из {total} участников."
+            )
+
+        await callback.message.reply("\n".join(text_creator_lines))
     except Exception as e:
-        logger.exception("Failed to notify about application decision: %s", e)
+        logger.exception("Failed to notify organizer about accepted application: %s", e)
+
+    # 2) Сообщение принятому участнику
+    try:
+        contacts_for_applicant = build_contacts_for(applicant_id)
+        await bot.send_message(
+            applicant_id,
+            f"Ура! Ваше участие в матче #{game_id} подтверждено организатором ✅\n\n"
+            f"Вот контакты других участников матча:\n{contacts_for_applicant}",
+        )
+    except Exception as e:
+        logger.exception("Failed to notify applicant about accepted application: %s", e)
+
+    # 3) Сообщения остальным участникам матча
+    try:
+        new_player_user = users_by_id.get(applicant_id)
+        new_player_contact = format_contact(new_player_user)
+
+        for pid in participant_ids:
+            if pid == applicant_id or pid == creator_id:
+                # Этим двоим уже отправили отдельные сообщения
+                continue
+            contacts_for_other = build_contacts_for(pid)
+            await bot.send_message(
+                pid,
+                f"К вашему матчу #{game_id} присоединился новый участник {new_player_contact} ✅\n\n"
+                f"Актуальный список участников (которым вы можете написать в Telegram):\n{contacts_for_other}",
+            )
+    except Exception as e:
+        logger.exception("Failed to notify existing participants about new one: %s", e)
 
     await callback.answer("Решение по заявке сохранено.", show_alert=False)
 
-# ---------- Отмена матча ----------
 
 @dp.callback_query(F.data.startswith("cancel_game:"))
 async def cancel_game_callback(callback: CallbackQuery):
