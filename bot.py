@@ -1156,26 +1156,35 @@ async def get_games_created_by_user(
 
 async def get_games_with_user_participation(user_id: int) -> List[aiosqlite.Row]:
     """
-    Матчи, где пользователь участвует (заявка принята).
+    Матчи, где пользователь участвует:
+    • матчи, где его заявка принята (game_applications.status = 'accepted')
+    • матчи, которые он сам создал "для себя" (creator_mode = 'self').
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT g.*,
+            SELECT DISTINCT
+                   g.*,
                    c.short_name AS court_short_name,
-                   c.address AS court_address,
-                   ga.status AS application_status,
-                   u.name AS creator_name,
-                   u.ntrp AS creator_ntrp
-            FROM game_applications ga
-            JOIN games g ON g.id = ga.game_id
+                   c.address  AS court_address,
+                   ga.status  AS application_status,
+                   u.name     AS creator_name,
+                   u.ntrp     AS creator_ntrp
+            FROM games g
             JOIN courts c ON c.id = g.court_id
+            LEFT JOIN game_applications ga
+              ON ga.game_id      = g.id
+             AND ga.status       = 'accepted'
+             AND ga.applicant_id = ?
             LEFT JOIN users u ON u.telegram_id = g.creator_id
-            WHERE ga.applicant_id = ?
-              AND ga.status = 'accepted';
+            WHERE g.is_active = 1
+              AND (
+                    ga.id IS NOT NULL                      -- принятая заявка
+                    OR (g.creator_id = ? AND g.creator_mode = 'self')  -- я создал "для себя"
+                  );
             """,
-            (user_id,),
+            (user_id, user_id),
         )
         rows = await cursor.fetchall()
         await cursor.close()
