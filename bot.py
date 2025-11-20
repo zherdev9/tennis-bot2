@@ -2434,7 +2434,7 @@ async def newgame_rating_max(message: Message, state: FSMContext):
         await message.answer(
             f"Максимальный рейтинг не может быть меньше минимального ({rating_min_val:.1f}).\n"
             "Попробуй ещё раз.",
-            reply_markup=build_rating_kb,
+                    reply_markup=build_rating_kb(),
         )
         return
 
