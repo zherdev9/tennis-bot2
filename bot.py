@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 import aiosqlite
@@ -41,13 +41,6 @@ MAX_REALISTIC_AGE = 100
 
 # Ограничение на создание матчей: не в прошлом и не дальше чем на 3 месяца вперёд
 MAX_MATCH_DAYS_AHEAD = 90
-
-# Локальная временная зона для расчёта дат/времени матчей.
-# По умолчанию используем Москву (UTC+3), но можно переопределить
-# через переменную окружения LOCAL_TZ_OFFSET (в часах).
-LOCAL_TZ_OFFSET = int(os.getenv("LOCAL_TZ_OFFSET", "3"))
-LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
-
 
 # Кол-во матчей на страницу в /games
 GAMES_PAGE_SIZE = 10
@@ -125,15 +118,6 @@ class MyGames(StatesGroup):
 # -----------------------------------------
 # Хелперы
 # -----------------------------------------
-
-
-def get_local_now() -> datetime:
-    """Текущее время в локальной (игровой) временной зоне."""
-    return datetime.now(LOCAL_TZ)
-
-def get_local_today() -> date:
-    """Текущая дата в локальной (игровой) временной зоне."""
-    return get_local_now().date()
 
 def calculate_age_from_str(birth_date_str: str) -> Optional[int]:
     """
@@ -439,6 +423,18 @@ date_choice_kb = ReplyKeyboardMarkup(
     resize_keyboard=True,
     one_time_keyboard=True,
 )
+
+
+def get_local_now() -> datetime:
+    """Текущее время в московском часовом поясе (UTC+3).
+    Используется для логики «сегодня/завтра» при создании и фильтрации матчей.
+    """
+    return datetime.utcnow() + timedelta(hours=3)
+
+
+def get_local_today() -> date:
+    return get_local_now().date()
+
 
 def generate_time_keyboard(match_date_obj: date) -> InlineKeyboardMarkup:
     """Клавиатура времени с шагом 30 минут.
