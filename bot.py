@@ -384,27 +384,7 @@ edit_menu_kb = ReplyKeyboardMarkup(
 HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
 
-def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
-    buttons: List[List[KeyboardButton]] = []
-    row: List[KeyboardButton] = []
-
-    for i, court in enumerate(courts, start=1):
-        row.append(KeyboardButton(text=court["short_name"]))
-        if i % 2 == 0:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append(
-        [KeyboardButton(text=HOME_DONE), KeyboardButton(text=HOME_SKIP)]
-    )
-
-    return ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+def build_home_courts_kb(courts: List[aiosq
 
 
 def build_courts_single_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
