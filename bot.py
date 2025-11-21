@@ -853,6 +853,20 @@ async def save_user_home_courts(telegram_id: int, court_ids: List[int]):
         await db.commit()
 
 
+
+
+async def update_username_only(tg_id: int, username: Optional[str]):
+    """Обновляет username в базе для пользователя, если он есть."""
+    if username is None:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET username = ? WHERE telegram_id = ?;",
+            (username, tg_id),
+        )
+        await db.commit()
+
+
 async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -1243,6 +1257,7 @@ async def get_games_with_user_participation(user_id: int) -> List[aiosqlite.Row]
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
 
     if user:
@@ -1273,6 +1288,7 @@ async def start_cmd(message: Message, state: FSMContext):
 
 @dp.message(F.text == "/me")
 async def profile_cmd(message: Message):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
 
     if not user:
@@ -1315,6 +1331,7 @@ async def profile_cmd(message: Message):
 
 @dp.message(F.text == "/reset")
 async def reset_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     await state.clear()
     await delete_user(message.from_user.id)
     await message.answer(
@@ -1326,6 +1343,7 @@ async def reset_cmd(message: Message, state: FSMContext):
 
 @dp.message(F.text == "/edit")
 async def edit_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer(
@@ -1665,6 +1683,7 @@ async def edit_photo(message: Message, state: FSMContext):
 
 @dp.message(F.text == "/help")
 async def help_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     if not ADMIN_CHAT_ID:
         await message.answer(
             "Пока поддержка не настроена 🛠\n"
@@ -2150,6 +2169,7 @@ async def get_photo(message: Message, state: FSMContext):
 
 @dp.message(F.text == "/newgame")
 async def newgame_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer(
@@ -2666,6 +2686,7 @@ async def newgame_comment(message: Message, state: FSMContext):
 
 @dp.message(F.text == "/games")
 async def games_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer(
@@ -3107,6 +3128,7 @@ async def _send_my_participating_games(message: Message, user_id: int):
 
 @dp.message(F.text == "/mygames")
 async def mygames_cmd(message: Message, state: FSMContext):
+    await update_username_only(message.from_user.id, message.from_user.username)
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer(
@@ -3266,6 +3288,7 @@ async def send_application_card_to_creator(
 
 @dp.callback_query(F.data.startswith("apply_game:"))
 async def apply_game_callback(callback: CallbackQuery):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
     try:
         _, game_id_str = data.split(":", 1)
@@ -3345,6 +3368,7 @@ async def apply_game_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("app_decision:"))
 async def app_decision_callback(callback: CallbackQuery):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
     try:
         _, app_id_str, action = data.split(":", 2)
@@ -3504,6 +3528,7 @@ async def app_decision_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cancel_game:"))
 async def cancel_game_callback(callback: CallbackQuery):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
     try:
         _, game_id_str = data.split(":", 1)
@@ -3555,6 +3580,7 @@ async def cancel_game_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("view_apps:"))
 async def view_apps_callback(callback: CallbackQuery):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
     try:
         _, game_id_str = data.split(":", 1)
@@ -3630,6 +3656,7 @@ async def view_apps_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("set_score:"))
 async def set_score_callback(callback: CallbackQuery, state: FSMContext):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
     try:
         _, game_id_str = data.split(":", 1)
