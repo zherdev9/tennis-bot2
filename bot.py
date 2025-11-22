@@ -2950,7 +2950,7 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
         addr = g["court_address"] or "Адрес не указан"
         occupied, total = await get_game_occupancy(g["id"])
 
-                time_line = (
+        time_line = (
             f"Время: {g['match_time']}–{g['match_end_time']}\n"
             if g["match_end_time"]
             else f"Время: {g['match_time']}\n"
