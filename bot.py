@@ -2796,9 +2796,12 @@ async def newgame_privacy(message: Message, state: FSMContext):
 
     await state.set_state(NewGame.comment)
     await message.answer(
-        "Добавь комментарий к игре (например, формат, пожелания).\n"
+        "Добавь комментарий к игре (например, сумму к оплате с каждого игрока или другие детали).\n"
         "Если ничего не хочешь добавлять — отправь «Пропустить».",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Пропустить")]],
+            resize_keyboard=True,
+        ),
     )
 
 
