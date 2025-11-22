@@ -612,8 +612,9 @@ games_date_filter_kb = ReplyKeyboardMarkup(
 games_time_choice_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Без фильтра по времени")],
-        [KeyboardButton(text="Указать время не раньше (ЧЧ:ММ)")],
-        [KeyboardButton(text="Отмена")],
+        [KeyboardButton(text="Утро"), KeyboardButton(text="День")],
+        [KeyboardButton(text="Вечер"), KeyboardButton(text="Ночь")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
@@ -1209,8 +1210,21 @@ async def get_games_for_listing(
             params.append(filter_date)
 
         if filter_time_from:
-            sql += " AND g.match_time >= ?"
-            params.append(filter_time_from)
+            if filter_time_from == "morning":
+                sql += " AND g.match_time >= ? AND g.match_time <= ?"
+                params.extend(["04:00", "10:00"])
+            elif filter_time_from == "day":
+                sql += " AND g.match_time >= ? AND g.match_time <= ?"
+                params.extend(["10:30", "16:00"])
+            elif filter_time_from == "evening":
+                sql += " AND g.match_time >= ? AND g.match_time <= ?"
+                params.extend(["16:30", "23:00"])
+            elif filter_time_from == "night":
+                sql += " AND (g.match_time >= ? OR g.match_time <= ?)"
+                params.extend(["23:30", "03:30"])
+            else:
+                sql += " AND g.match_time >= ?"
+                params.append(filter_time_from)
 
         if only_home:
             sql += """
@@ -2964,7 +2978,10 @@ async def games_date_choice(message: Message, state: FSMContext):
     await message.answer(
         "Фильтр по времени:\n"
         "• Без фильтра\n"
-        "• Или указать время, не раньше которого искать (ЧЧ:ММ)",
+        "• Утро (04:00–10:00)\n"
+        "• День (10:30–16:00)\n"
+        "• Вечер (16:30–23:00)\n"
+        "• Ночь (23:30–03:30)",
         reply_markup=games_time_choice_kb,
     )
 
@@ -2994,7 +3011,10 @@ async def games_date_manual(message: Message, state: FSMContext):
     await message.answer(
         "Фильтр по времени:\n"
         "• Без фильтра\n"
-        "• Или указать время, не раньше которого искать (ЧЧ:ММ)",
+        "• Утро (04:00–10:00)\n"
+        "• День (10:30–16:00)\n"
+        "• Вечер (16:30–23:00)\n"
+        "• Ночь (23:30–03:30)",
         reply_markup=games_time_choice_kb,
     )
 
@@ -3011,15 +3031,27 @@ async def games_time_choice(message: Message, state: FSMContext):
         )
         return
 
-    if text == "Без фильтра по времени":
-        await state.update_data(filter_time_from=None)
-    elif text == "Указать время не раньше (ЧЧ:ММ)":
-        await state.set_state(ViewGames.time_manual)
+    if text == "Назад":
+        await state.set_state(ViewGames.date_choice)
         await message.answer(
-            "Введи время в формате ЧЧ:ММ\nНапример: 18:00",
-            reply_markup=ReplyKeyboardRemove(),
+            "Фильтр по дате:\n"
+            "• Сегодня / Завтра\n"
+            "• Ввести конкретную дату\n"
+            "• Или выбрать «Все даты»",
+            reply_markup=games_date_filter_kb,
         )
         return
+
+    if text == "Без фильтра по времени":
+        await state.update_data(filter_time_from=None)
+    elif text == "Утро":
+        await state.update_data(filter_time_from="morning")
+    elif text == "День":
+        await state.update_data(filter_time_from="day")
+    elif text == "Вечер":
+        await state.update_data(filter_time_from="evening")
+    elif text == "Ночь":
+        await state.update_data(filter_time_from="night")
     else:
         await message.answer(
             "Пожалуйста, выбери вариант на клавиатуре.",
