@@ -384,8 +384,30 @@ edit_menu_kb = ReplyKeyboardMarkup(
 HOME_DONE = "Готово ✅"
 HOME_SKIP = "Пропустить"
 
-def build_home_courts_kb(courts: List[aiosq
+def build_home_courts_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
+    """Клавиатура выбора домашних кортов с кнопкой «Готово» вверху."""
+    buttons: List[List[KeyboardButton]] = []
+    row: List[KeyboardButton] = []
 
+    # Сначала строка с «Готово» / «Пропустить»
+    buttons.append(
+        [KeyboardButton(text=HOME_DONE), KeyboardButton(text=HOME_SKIP)]
+    )
+
+    # Затем сами корты по 2 в строке
+    for i, court in enumerate(courts, start=1):
+        row.append(KeyboardButton(text=court["short_name"]))
+        if i % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 def build_courts_single_kb(courts: List[aiosqlite.Row]) -> ReplyKeyboardMarkup:
     """
@@ -592,13 +614,16 @@ games_browse_kb = ReplyKeyboardMarkup(
 
 my_games_main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Созданные мной")],
-        [KeyboardButton(text="Матчи с моим участием")],
-        [KeyboardButton(text="Отмена")],
+        [KeyboardButton(text="Предстоящие матчи")],
+        [KeyboardButton(text="Завершённые матчи")],
+        [KeyboardButton(text="Отменённые матчи")],
+        [KeyboardButton(text="Все мои матчи")],
+        [KeyboardButton(text="Назад")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
+
 
 my_games_created_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -2976,18 +3001,23 @@ async def games_browsing(message: Message, state: FSMContext):
 # Мои матчи: /mygames
 # -----------------------------------------
 
-async def _send_created_games_list(message: Message, user_id: int, status: str):
+async def _send_created_games_list(message: Message, user_id: int, status: Optional[str]):
     """
-    Используется в разделе «Созданные мной»:
-    статус 'scheduled' — предстоящие, 'finished' — завершённые.
+    Список матчей пользователя по статусу.
+    status может быть: "scheduled", "finished", "cancelled" или None (все матчи).
     """
     games = await get_games_created_by_user(user_id, status=status)
     if not games:
         if status == "scheduled":
             await message.answer("У тебя пока нет предстоящих матчей.")
-        else:
+        elif status == "finished":
             await message.answer("У тебя пока нет завершённых матчей.")
+        elif status == "cancelled":
+            await message.answer("У тебя пока нет отменённых матчей.")
+        else:
+            await message.answer("У тебя пока нет матчей.")
         return
+
 
     for g in games:
         if g["rating_min"] is not None and g["rating_max"] is not None:
@@ -3130,20 +3160,32 @@ async def mygames_cmd(message: Message, state: FSMContext):
 async def mygames_main_handler(message: Message, state: FSMContext):
     text = (message.text or "").strip()
 
-    if text == "Созданные мной":
-        await state.set_state(MyGames.created_menu)
+    if text == "Предстоящие матчи":
+        await _send_created_games_list(message, message.from_user.id, status="scheduled")
         await message.answer(
-            "Созданные тобой матчи.\nВыбери:",
-            reply_markup=my_games_created_kb,
-        )
-    elif text == "Матчи с моим участием":
-        await _send_my_participating_games(message, message.from_user.id)
-        # остаёмся в этом же меню
-        await message.answer(
-            "Выбери действие:",
+            "Раздел «Мои матчи».\nВыбери, что показать:",
             reply_markup=my_games_main_kb,
         )
-    elif text == "Отмена":
+    elif text == "Завершённые матчи":
+        await _send_created_games_list(message, message.from_user.id, status="finished")
+        await message.answer(
+            "Раздел «Мои матчи».\nВыбери, что показать:",
+            reply_markup=my_games_main_kb,
+        )
+    elif text == "Отменённые матчи":
+        await _send_created_games_list(message, message.from_user.id, status="cancelled")
+        await message.answer(
+            "Раздел «Мои матчи».\nВыбери, что показать:",
+            reply_markup=my_games_main_kb,
+        )
+    elif text == "Все мои матчи":
+        # Без фильтра по статусу — покажем все матчи пользователя
+        await _send_created_games_list(message, message.from_user.id, status=None)
+        await message.answer(
+            "Раздел «Мои матчи».\nВыбери, что показать:",
+            reply_markup=my_games_main_kb,
+        )
+    elif text == "Назад":
         await state.clear()
         await message.answer(
             "Выход из раздела «Мои матчи».",
@@ -3153,28 +3195,6 @@ async def mygames_main_handler(message: Message, state: FSMContext):
         await message.answer(
             "Пожалуйста, выбери вариант на клавиатуре.",
             reply_markup=my_games_main_kb,
-        )
-
-
-@dp.message(MyGames.created_menu)
-async def mygames_created_menu_handler(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-
-    if text == "Предстоящие матчи":
-        await _send_created_games_list(message, message.from_user.id, status="scheduled")
-    elif text == "Завершённые матчи":
-        await _send_created_games_list(message, message.from_user.id, status="finished")
-    elif text == "Назад":
-        await state.set_state(MyGames.main)
-        await message.answer(
-            "Раздел «Мои матчи».",
-            reply_markup=my_games_main_kb,
-        )
-        return
-    else:
-        await message.answer(
-            "Пожалуйста, выбери вариант на клавиатуре.",
-            reply_markup=my_games_created_kb,
         )
 
 # ---------- Заявка на матч: helper для карточки ----------
