@@ -108,7 +108,7 @@ class NewGame(StatesGroup):
     date_choice = State()
     date_manual = State()
     time = State()
-    duration = State()
+    end_time = State()
     game_type = State()
     rating_limit_choice = State()
     rating_min = State()
@@ -173,58 +173,6 @@ def parse_time(text: str) -> Optional[str]:
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return None
     return f"{hh:02d}:{mm:02d}"
-
-def format_duration(minutes: int) -> str:
-    """
-    Преобразует длительность в минутах к строке вида "1 ч 30 мин".
-    """
-    hours, mins = divmod(minutes, 60)
-    parts = []
-    if hours > 0:
-        parts.append(f"{hours} ч")
-    if mins > 0:
-        parts.append(f"{mins} мин")
-    if not parts:
-        parts.append("0 мин")
-    return " ".join(parts)
-
-
-def calc_duration_minutes(start: Optional[str], end: Optional[str]) -> Optional[int]:
-    """
-    Вычисляет длительность матча в минутах по времени начала и окончания.
-    Если что-то не так или длительность <= 0, возвращает None.
-    """
-    if not start or not end:
-        return None
-    try:
-        sh, sm = map(int, start.split(":"))
-        eh, em = map(int, end.split(":"))
-    except Exception:
-        return None
-
-    diff = (eh * 60 + em) - (sh * 60 + sm)
-    if diff <= 0:
-        return None
-    return diff
-
-
-def build_time_line(start: Optional[str], end: Optional[str]) -> str:
-    """
-    Формирует строку с временем и (при наличии) длительностью матча.
-    """
-    if start and end:
-        duration = calc_duration_minutes(start, end)
-        if duration is not None:
-            return (
-                f"Время: {start}–{end}\n"
-                f"Продолжительность: {format_duration(duration)}\n"
-            )
-        return f"Время: {start}–{end}\n"
-    if start:
-        return f"Время: {start}\n"
-    if end:
-        return f"Время окончания: {end}\n"
-    return ""
 
 
 def parse_ntrp_from_button(text: str) -> Optional[float]:
@@ -558,16 +506,6 @@ game_type_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Тренировка")],
         [KeyboardButton(text="Матч на рейтинг")],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
-duration_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="30 мин"), KeyboardButton(text="1 ч")],
-        [KeyboardButton(text="1 ч 30 мин"), KeyboardButton(text="2 ч")],
-        [KeyboardButton(text="2 ч 30 мин"), KeyboardButton(text="3 ч")],
     ],
     resize_keyboard=True,
     one_time_keyboard=True,
@@ -2258,47 +2196,13 @@ async def newgame_cmd(message: Message, state: FSMContext):
         )
         return
 
+    # Теперь все матчи создаются для себя, без выбора режима
     await state.clear()
-    await state.set_state(NewGame.creator_mode)
-    await message.answer(
-        "Создаём новый матч 🎾\n\n"
-        "Кого ты записываешь на матч?",
-        reply_markup=creator_mode_kb,
-    )
-
-
-@dp.message(NewGame.creator_mode)
-async def newgame_creator_mode(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if text == "Отмена":
-        await state.clear()
-        await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    if text == "Создаю матч для себя":
-        mode = "self"
-    elif text == "Создаю матч для других":
-        mode = "others"
-    else:
-        await message.answer(
-            "Пожалуйста, выбери один из вариантов на клавиатуре 🙂",
-            reply_markup=creator_mode_kb,
-        )
-        return
-
-    await state.update_data(creator_mode=mode)
+    await state.update_data(creator_mode="self")
     await state.set_state(NewGame.court)
 
-    courts = await get_active_courts()
-    if not courts:
-        await message.answer(
-            "В базе пока нет ни одного корта. Обратись к админу.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await state.clear()
-        return
-
     await message.answer(
+        "Создаём новый матч 🎾\n\n"
         "Выбери корт, на котором планируешь играть:",
         reply_markup=build_courts_single_kb(courts),
     )
@@ -2478,15 +2382,14 @@ async def newgame_time_choice(callback: CallbackQuery, state: FSMContext):
     time_str = callback.data.split("newgame_time:", 1)[1]
 
     await state.update_data(match_time=time_str)
-    await state.set_state(NewGame.duration)
+    await state.set_state(NewGame.end_time)
 
+    await callback.message.answer(f"Время начала матча: {time_str}")
     await callback.message.answer(
-        f"Время начала матча: {time_str}\n"
-        "Теперь выбери продолжительность матча:",
-        reply_markup=duration_kb,
+        "Теперь укажи время окончания матча в формате ЧЧ:ММ.\n"
+        "Например: 20:30",
     )
     await callback.answer()
-
 
 @dp.message(NewGame.time)
 async def newgame_time(message: Message, state: FSMContext):
@@ -2500,65 +2403,50 @@ async def newgame_time(message: Message, state: FSMContext):
 
     await state.update_data(match_time=time_str)
 
-    await state.set_state(NewGame.duration)
+    await state.set_state(NewGame.end_time)
+    await message.answer(f"Время начала матча: {time_str}")
     await message.answer(
-        f"Время начала матча: {time_str}\n"
-        "Теперь выбери продолжительность матча:",
-        reply_markup=duration_kb,
+        "Теперь укажи время окончания матча в формате ЧЧ:ММ.\n"
+        "Например: 20:30",
     )
 
 
-@dp.message(NewGame.duration)
-async def newgame_duration(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
 
-    duration_map = {
-        "30 мин": 30,
-        "1 ч": 60,
-        "1 ч 30 мин": 90,
-        "2 ч": 120,
-        "2 ч 30 мин": 150,
-        "3 ч": 180,
-    }
 
-    minutes = duration_map.get(text)
-    if minutes is None:
+@dp.message(NewGame.end_time)
+async def newgame_end_time(message: Message, state: FSMContext):
+    end_time_str = parse_time(message.text or "")
+    if not end_time_str:
         await message.answer(
-            "Пожалуйста, выбери продолжительность матча с помощью кнопок ниже 🙂",
-            reply_markup=duration_kb,
+            "Не похоже на время 😅\n"
+            "Нужен формат ЧЧ:ММ, например: 21:30",
         )
         return
 
     data = await state.get_data()
     start_time_str = data.get("match_time")
 
-    if not start_time_str:
-        await message.answer(
-            "Не получилось найти время начала матча. Давай начнём заново: /newgame",
-        )
-        await state.clear()
-        return
+    if start_time_str:
+        try:
+            sh, sm = map(int, start_time_str.split(":"))
+            eh, em = map(int, end_time_str.split(":"))
+            start_minutes = sh * 60 + sm
+            end_minutes = eh * 60 + em
+            if end_minutes <= start_minutes:
+                await message.answer(
+                    "Время окончания матча должно быть позже времени начала.\n"
+                    "Попробуй ещё раз, например: 21:30",
+                )
+                return
+        except Exception:
+            # На всякий случай, если что-то пошло не так — просто примем время без проверки
+            pass
 
-    try:
-        sh, sm = map(int, start_time_str.split(":"))
-        start_dt = datetime(2000, 1, 1, sh, sm)
-        end_dt = start_dt + timedelta(minutes=minutes)
-        end_time_str = end_dt.strftime("%H:%M")
-    except Exception:
-        # На всякий случай, если что-то пошло не так — просто примем время без вычислений
-        end_time_str = start_time_str
-
-    await state.update_data(
-        match_end_time=end_time_str,
-        match_duration_minutes=minutes,
-    )
-
-    duration_str = format_duration(minutes)
+    await state.update_data(match_end_time=end_time_str)
 
     await state.set_state(NewGame.game_type)
     await message.answer(
-        f"Время матча: {start_time_str}–{end_time_str}\n"
-        f"Продолжительность: {duration_str}",
+        f"Время матча: {start_time_str}–{end_time_str}",
     )
     await message.answer(
         "Выбери тип матча:",
@@ -2798,7 +2686,11 @@ async def newgame_comment(message: Message, state: FSMContext):
     comment_text = comment if comment else "—"
     occupied, total = await get_game_occupancy(game_id)
 
-    time_line = build_time_line(match_time, match_end_time)
+    time_line = (
+        f"Время: {match_time}–{match_end_time}\n"
+        if match_end_time
+        else f"Время: {match_time}\n"
+    )
 
     txt = (
         "Матч создан ✅\n\n"
@@ -3024,7 +2916,11 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
         addr = g["court_address"] or "Адрес не указан"
         occupied, total = await get_game_occupancy(g["id"])
 
-        time_line = build_time_line(g['match_time'], g['match_end_time'])
+        time_line = (
+            f"Время: {g['match_time']}–{g['match_end_time']}\n"
+            if g["match_end_time"]
+            else f"Время: {g['match_time']}\n"
+        )
 
         txt = (
             f"🎾 <b>Матч #{g['id']}</b>\n\n"
@@ -3251,7 +3147,11 @@ async def _send_my_participating_games(message: Message, user_id: int):
         else:
             participation_line = "Твоё участие: заявка принята ✅"
 
-        time_line = build_time_line(g['match_time'], g['match_end_time'])
+        time_line = (
+            f"Время: {g['match_time']}–{g['match_end_time']}\n"
+            if g["match_end_time"]
+            else f"Время: {g['match_time']}\n"
+        )
 
         txt = (
             f"🎾 <b>Матч #{g['id']}</b>\n\n"
