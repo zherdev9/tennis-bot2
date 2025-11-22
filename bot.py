@@ -109,6 +109,7 @@ class NewGame(StatesGroup):
     date_manual = State()
     time = State()
     end_time = State()
+    payment_type = State()
     game_type = State()
     rating_limit_choice = State()
     rating_min = State()
@@ -514,6 +515,19 @@ creator_mode_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+# Тип оплаты за корт
+payment_type_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Делим поровну между всеми игроками")],
+        [KeyboardButton(text="Плачу я (организатор)")],
+        [KeyboardButton(text="Обсудим в чате")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
 # Тип игры
 game_type_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -716,6 +730,7 @@ async def init_db():
                 is_court_booked INTEGER DEFAULT 0,
                 visibility TEXT DEFAULT 'public',
                 creator_mode TEXT DEFAULT 'self',
+                payment_type TEXT,
                 is_active INTEGER DEFAULT 1,
                 status TEXT DEFAULT 'scheduled',
                 score TEXT,
@@ -822,6 +837,7 @@ async def _ensure_games_columns(db: aiosqlite.Connection):
         "score": "TEXT",
         "match_end_time": "TEXT",
         "duration_minutes": "INTEGER",
+        "payment_type": "TEXT",
     }
 
     for col, coltype in needed.items():
@@ -1017,6 +1033,7 @@ async def create_game(
     is_court_booked: bool,
     visibility: str,
     creator_mode: str = "self",
+    payment_type: Optional[str] = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -1025,9 +1042,9 @@ async def create_game(
                 creator_id, court_id, match_date, match_time, match_end_time, duration_minutes,
                 game_type, rating_min, rating_max,
                 players_count, comment,
-                is_court_booked, visibility, creator_mode, is_active, status
+                is_court_booked, visibility, creator_mode, payment_type, is_active, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'scheduled');
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'scheduled');
             """,
             (
                 creator_id,
@@ -1044,6 +1061,7 @@ async def create_game(
                 1 if is_court_booked else 0,
                 visibility,
                 creator_mode,
+                payment_type,
             ),
         )
         cursor = await db.execute("SELECT last_insert_rowid();")
@@ -2505,15 +2523,16 @@ async def newgame_duration_choice(callback: CallbackQuery, state: FSMContext):
         duration_text = f"{mins} мин"
 
     await state.update_data(match_end_time=end_time_str, duration_minutes=duration_minutes)
-    await state.set_state(NewGame.game_type)
+    await state.set_state(NewGame.payment_type)
 
     await callback.message.answer(
         f"Время матча: {start_time_str}–{end_time_str}\n"
         f"Длительность: {duration_text}",
     )
     await callback.message.answer(
-        "Выбери тип матча:",
-        reply_markup=game_type_kb,
+        "💰 Как планируешь делить оплату за корт?\n"
+        "Выбери вариант, чтобы игроки сразу всё понимали.",
+        reply_markup=payment_type_kb,
     )
     await callback.answer()
 
@@ -2565,15 +2584,48 @@ async def newgame_end_time(message: Message, state: FSMContext):
 
     await state.update_data(match_end_time=end_time_str, duration_minutes=duration_minutes)
 
-    await state.set_state(NewGame.game_type)
+    await state.set_state(NewGame.payment_type)
     await message.answer(
         f"Время матча: {start_time_str}–{end_time_str}\n"
         f"Длительность: {duration_text}",
     )
     await message.answer(
+        "💰 Как планируешь делить оплату за корт?\n"
+        "Выбери вариант, чтобы игроки сразу всё понимали.",
+        reply_markup=payment_type_kb,
+    )
+
+@dp.message(NewGame.payment_type)
+async def newgame_payment_type(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if text == "Отмена":
+        await state.clear()
+        await message.answer("Создание игры отменено.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if text == "Делим поровну между всеми игроками":
+        payment_type = "split"
+    elif text == "Плачу я (организатор)":
+        payment_type = "creator"
+    elif text == "Обсудим в чате":
+        payment_type = "discuss"
+    else:
+        await message.answer(
+            "Пожалуйста, выбери один из вариантов на клавиатуре 🙂",
+            reply_markup=payment_type_kb,
+        )
+        return
+
+    await state.update_data(payment_type=payment_type)
+
+    await state.set_state(NewGame.game_type)
+    await message.answer(
         "Выбери тип матча:",
         reply_markup=game_type_kb,
     )
+
+
 @dp.message(NewGame.game_type)
 async def newgame_game_type(message: Message, state: FSMContext):
     text = (message.text or "").strip()
@@ -2774,6 +2826,7 @@ async def newgame_comment(message: Message, state: FSMContext):
     is_court_booked = data.get("is_court_booked", False)
     visibility = data.get("visibility", "public")
     creator_mode = data.get("creator_mode", "self")
+    payment_type = data.get("payment_type")
 
     game_id = await create_game(
         creator_id=message.from_user.id,
@@ -2790,6 +2843,7 @@ async def newgame_comment(message: Message, state: FSMContext):
         is_court_booked=is_court_booked,
         visibility=visibility,
         creator_mode=creator_mode,
+        payment_type=payment_type,
     )
 
     court_row = await get_court_by_id(court_id)
@@ -2805,6 +2859,16 @@ async def newgame_comment(message: Message, state: FSMContext):
 
     booking_text = "забронирован" if is_court_booked else "не забронирован"
     privacy_text = "приватный матч" if visibility == "private" else "публичный матч"
+
+    if payment_type == "split":
+        payment_text = "делим поровну между всеми игроками"
+    elif payment_type == "creator":
+        payment_text = "организатор оплачивает корт"
+    elif payment_type == "discuss":
+        payment_text = "обсудим оплату в чате"
+    else:
+        payment_text = "не указано"
+
     comment_text = comment if comment else "—"
     occupied, total = await get_game_occupancy(game_id)
 
@@ -2824,6 +2888,7 @@ async def newgame_comment(message: Message, state: FSMContext):
         f"Игроки: {occupied} из {total}\n"
         f"Ограничение по рейтингу: {rating_text}\n"
         f"Бронь корта: {booking_text}\n"
+        f"Оплата: {payment_text}\n"
         f"Приватность: {privacy_text}\n"
         f"Комментарий: {comment_text}"
     )
@@ -3028,6 +3093,17 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
 
         booking_text = "забронирован" if g["is_court_booked"] else "не забронирован"
         comment_text = g["comment"] if g["comment"] else "—"
+
+        payment_type = g["payment_type"]
+        if payment_type == "split":
+            payment_text = "делим поровну между всеми игроками"
+        elif payment_type == "creator":
+            payment_text = "организатор оплачивает корт"
+        elif payment_type == "discuss":
+            payment_text = "обсудим оплату в чате"
+        else:
+            payment_text = "не указано"
+
         creator_name = g["creator_name"] or "Игрок"
         creator_ntrp = g["creator_ntrp"]
         if creator_ntrp is not None:
@@ -3070,6 +3146,7 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
             f"Игроки: {occupied} из {total}\n"
             f"Ограничение по рейтингу: {rating_text}\n"
             f"Бронь корта: {booking_text}\n"
+            f"Оплата: {payment_text}\n"
             f"Комментарий: {comment_text}"
         )
 
@@ -3198,6 +3275,17 @@ async def _send_created_games_list(message: Message, user_id: int, status: Optio
         occupied, total = await get_game_occupancy(g["id"])
         score_text = g["score"] or "—"
 
+        payment_type = g["payment_type"]
+        if payment_type == "split":
+            payment_text = "делим поровну между всеми игроками"
+        elif payment_type == "creator":
+            payment_text = "организатор оплачивает корт"
+        elif payment_type == "discuss":
+            payment_text = "обсудим оплату в чате"
+        else:
+            payment_text = "не указано"
+
+
         duration_minutes = g['duration_minutes']
         if duration_minutes:
             hours = duration_minutes // 60
@@ -3231,6 +3319,7 @@ async def _send_created_games_list(message: Message, user_id: int, status: Optio
             f"Игроки: {occupied} из {total}\n"
             f"Ограничение по рейтингу: {rating_text}\n"
             f"Бронь корта: {booking_text}\n"
+            f"Оплата: {payment_text}\n"
             f"Комментарий: {comment_text}\n"
             f"Счёт: {score_text}"
         )
@@ -3292,6 +3381,17 @@ async def _send_my_participating_games(message: Message, user_id: int):
 
         booking_text = "забронирован" if g["is_court_booked"] else "не забронирован"
         comment_text = g["comment"] if g["comment"] else "—"
+
+        payment_type = g["payment_type"]
+        if payment_type == "split":
+            payment_text = "делим поровну между всеми игроками"
+        elif payment_type == "creator":
+            payment_text = "организатор оплачивает корт"
+        elif payment_type == "discuss":
+            payment_text = "обсудим оплату в чате"
+        else:
+            payment_text = "не указано"
+
         addr = g["court_address"] or "Адрес не указан"
         occupied, total = await get_game_occupancy(g["id"])
         score_text = g["score"] or "—"
@@ -3345,6 +3445,7 @@ async def _send_my_participating_games(message: Message, user_id: int):
             f"Игроки: {occupied} из {total}\n"
             f"Ограничение по рейтингу: {rating_text}\n"
             f"Бронь корта: {booking_text}\n"
+            f"Оплата: {payment_text}\n"
             f"Комментарий: {comment_text}\n"
             f"Счёт: {score_text}"
         )
