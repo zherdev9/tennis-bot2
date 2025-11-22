@@ -2214,11 +2214,12 @@ async def newgame_cmd(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await state.set_state(NewGame.creator_mode)
+    await state.update_data(creator_mode="self")
+    await state.set_state(NewGame.court)
     await message.answer(
         "Создаём новый матч 🎾\n\n"
-        "Кого ты записываешь на матч?",
-        reply_markup=creator_mode_kb,
+        "Выбери корт, на котором планируешь играть:",
+        reply_markup=build_courts_single_kb(courts),
     )
 
 
