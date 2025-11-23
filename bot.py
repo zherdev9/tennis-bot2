@@ -2976,12 +2976,7 @@ async def games_date_choice(message: Message, state: FSMContext):
     # Переход к фильтру по времени
     await state.set_state(ViewGames.time_choice)
     await message.answer(
-        "Фильтр по времени:\n"
-        "• Без фильтра\n"
-        "• Утро (04:00–10:00)\n"
-        "• День (10:30–16:00)\n"
-        "• Вечер (16:30–23:00)\n"
-        "• Ночь (23:30–03:30)",
+        "Выбери время суток для подходящих тебе матчей.",
         reply_markup=games_time_choice_kb,
     )
 
@@ -3009,12 +3004,7 @@ async def games_date_manual(message: Message, state: FSMContext):
 
     await state.set_state(ViewGames.time_choice)
     await message.answer(
-        "Фильтр по времени:\n"
-        "• Без фильтра\n"
-        "• Утро (04:00–10:00)\n"
-        "• День (10:30–16:00)\n"
-        "• Вечер (16:30–23:00)\n"
-        "• Ночь (23:30–03:30)",
+        "Выбери время суток для подходящих тебе матчей.",
         reply_markup=games_time_choice_kb,
     )
 
