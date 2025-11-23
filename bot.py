@@ -4151,18 +4151,31 @@ async def invite_players_callback(callback: CallbackQuery):
         if username:
             txt += f"\nСвязаться: @{username}"
 
+        kb_player = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📨 Пригласить в матч",
+                        callback_data=f"send_invite:{game_id}:{r['telegram_id']}",
+                    )
+                ]
+            ]
+        )
+
         if photo_file_id:
             await bot.send_photo(
                 callback.from_user.id,
                 photo=photo_file_id,
                 caption=txt,
                 parse_mode="HTML",
+                reply_markup=kb_player,
             )
         else:
             await bot.send_message(
                 callback.from_user.id,
                 txt,
                 parse_mode="HTML",
+                reply_markup=kb_player,
             )
 
     # Кнопка «Показать ещё», если есть следующая страница
@@ -4179,6 +4192,322 @@ async def invite_players_callback(callback: CallbackQuery):
             ]
         )
         await callback.message.reply("Показать ещё игроков для приглашения?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("send_invite:"))
+async def send_invite_callback(callback: CallbackQuery):
+    """Обработка нажатия кнопки "Пригласить в матч" под карточкой игрока."""
+    await update_username_only(callback.from_user.id, callback.from_user.username)
+    data = callback.data or ""
+    try:
+        _, game_id_str, user_id_str = data.split(":", 2)
+        game_id = int(game_id_str)
+        invited_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Некорректные данные приглашения.", show_alert=False)
+        return
+
+    # Получаем матч
+    game = await get_game_by_id(game_id)
+    if not game:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    # Только создатель матча может отправлять приглашения
+    if game["creator_id"] != callback.from_user.id:
+        await callback.answer("Приглашать игроков может только организатор матча.", show_alert=True)
+        return
+
+    # Проверим статус матча
+    if game["status"] != "scheduled":
+        await callback.answer("Приглашать игроков можно только на предстоящие матчи.", show_alert=True)
+        return
+
+    # Проверяем, не полон ли матч
+    occupied, total = await get_game_occupancy(game_id)
+    if occupied >= total:
+        await callback.answer("Матч уже укомплектован — свободных мест нет.", show_alert=True)
+        return
+
+    # Проверяем, не является ли этот игрок уже участником
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+    if invited_id in participant_ids:
+        await callback.answer("Этот игрок уже участвует в матче.", show_alert=False)
+        return
+
+    # Пытаемся получить профиль приглашаемого игрока (на будущее, если понадобится)
+    invited_user = await get_user(invited_id)
+
+    creator_user = await get_user(callback.from_user.id)
+    creator_name = (creator_user and creator_user.get("name")) or "Игрок"
+    creator_username = creator_user.get("username") if creator_user else None
+    if creator_username:
+        creator_line = f"{creator_name} (@{creator_username})"
+    else:
+        creator_line = creator_name
+
+    addr = game["court_address"] or "Адрес не указан"
+
+    # Формируем текст приглашения
+    match_date = game["match_date"] or ""
+    match_time = game["match_time"] or ""
+    match_end_time = game.get("match_end_time")
+    if match_end_time:
+        time_line = f"{match_time}–{match_end_time}"
+    else:
+        time_line = f"{match_time}"
+
+    comment_text = game["comment"] if game["comment"] else "—"
+
+    invite_text = (
+        f"🎾 Тебя приглашают на матч #{game_id}!\n\n"
+        f"Организатор: {creator_line}\n"
+        f"Дата: {match_date}\n"
+        f"Время: {time_line}\n"
+        f"Корт: {game['court_short_name']} — 📍 {addr}\n"
+        f"Комментарий организатора: {comment_text}\n\n"
+        f"Готов(а) присоединиться?"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Принять приглашение",
+                    callback_data=f"invite_decision:{game_id}:accept",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"invite_decision:{game_id}:reject",
+                ),
+            ]
+        ]
+    )
+
+    try:
+        await bot.send_message(invited_id, invite_text, reply_markup=kb)
+    except Exception as e:
+        logger.exception("Failed to send invitation: %s", e)
+        await callback.answer("Не удалось отправить приглашение этому игроку 😔", show_alert=True)
+        return
+
+    await callback.answer("Приглашение отправлено игроку ✅", show_alert=False)
+
+
+@dp.callback_query(F.data.startswith("invite_decision:"))
+async def invite_decision_callback(callback: CallbackQuery):
+    """Обработка решения игрока по приглашению (принять/отклонить)."""
+    await update_username_only(callback.from_user.id, callback.from_user.username)
+    data = callback.data or ""
+    try:
+        _, game_id_str, action = data.split(":", 2)
+        game_id = int(game_id_str)
+        assert action in ("accept", "reject")
+    except Exception:
+        await callback.answer("Некорректные данные приглашения.", show_alert=False)
+        return
+
+    game = await get_game_by_id(game_id)
+    if not game:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    invited_id = callback.from_user.id
+    creator_id = game["creator_id"]
+
+    # Матч должен быть в статусе 'scheduled'
+    if game["status"] != "scheduled":
+        await callback.answer("Этот матч уже недоступен для участия.", show_alert=True)
+        return
+
+    # Текущий список участников
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+
+    if action == "reject":
+        # Игрок отклонил приглашение
+        try:
+            # Зафиксируем это в таблице заявок, чтобы в будущем можно было анализировать
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id FROM game_applications WHERE game_id = ? AND applicant_id = ?;",
+                    (game_id, invited_id),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+
+                if row:
+                    await db.execute(
+                        "UPDATE game_applications SET status = 'rejected' WHERE id = ?;",
+                        (row["id"],),
+                    )
+                else:
+                    await db.execute(
+                        "INSERT INTO game_applications (game_id, applicant_id, status) VALUES (?, ?, 'rejected');",
+                        (game_id, invited_id),
+                    )
+                await db.commit()
+        except Exception as e:
+            logger.exception("Failed to store rejected invitation: %s", e)
+
+        # Сообщение самому игроку
+        await callback.answer("Приглашение отклонено.", show_alert=False)
+        try:
+            await bot.send_message(
+                invited_id,
+                f"Ты отклонил приглашение на матч #{game_id}.",
+            )
+        except Exception:
+            pass
+
+        # Уведомляем организатора
+        try:
+            invited_user = await get_user(invited_id)
+
+            def _format_contact(u) -> str:
+                if not u:
+                    return "Игрок"
+                username = u["username"]
+                name = u["name"] or "Игрок"
+                if username:
+                    return f"{name} (@{username})"
+                return name
+
+            invited_contact = _format_contact(invited_user)
+            await bot.send_message(
+                creator_id,
+                f"Игрок {invited_contact} отклонил приглашение на матч #{game_id}.",
+            )
+        except Exception as e:
+            logger.exception("Failed to notify creator about rejected invitation: %s", e)
+
+        return
+
+    # Если игрок уже числится участником, повторно принимать не нужно
+    if invited_id in participant_ids:
+        await callback.answer("Ты уже участвуешь в этом матче.", show_alert=True)
+        return
+
+    # Проверим заполняемость матча
+    occupied, total = await get_game_occupancy(game_id)
+    if occupied >= total:
+        await callback.answer("К сожалению, в матче больше нет свободных мест.", show_alert=True)
+        return
+
+    # Фиксируем участие игрока как принятую заявку
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, status FROM game_applications WHERE game_id = ? AND applicant_id = ?;",
+                (game_id, invited_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+
+            if not row:
+                # Создаём запись сразу со статусом accepted
+                await db.execute(
+                    "INSERT INTO game_applications (game_id, applicant_id, status) VALUES (?, ?, 'accepted');",
+                    (game_id, invited_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE game_applications SET status = 'accepted' WHERE id = ?;",
+                    (row["id"],),
+                )
+
+            await db.commit()
+    except Exception as e:
+        logger.exception("Failed to store accepted invitation: %s", e)
+        await callback.answer("Не удалось сохранить участие, попробуй позже.", show_alert=True)
+        return
+
+    # Обновим список участников с учётом принятого приглашения
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+
+    # Словарь профилей участников
+    users_by_id = {}
+    for pid in participant_ids:
+        u = await get_user(pid)
+        if u:
+            users_by_id[pid] = u
+
+    def format_contact(u) -> str:
+        if not u:
+            return "Игрок (профиль недоступен)"
+        username = u["username"]
+        name = u["name"] or "Игрок"
+        if username:
+            return f"@{username}"
+        return name
+
+    def build_contacts_for(recipient_id: int) -> str:
+        contacts = []
+        for pid in participant_ids:
+            if pid == recipient_id:
+                continue
+            u = users_by_id.get(pid)
+            if not u:
+                continue
+            contacts.append(format_contact(u))
+        if not contacts:
+            return "Пока нет других участников с указанным Telegram-ником."
+        return "\n".join(f"• {c}" for c in contacts)
+
+    # Текущая заполняемость матча
+    occupied, total = await get_game_occupancy(game_id)
+
+    # 1) Сообщение организатору
+    try:
+        new_player_user = users_by_id.get(invited_id)
+        new_player_contact = format_contact(new_player_user)
+
+        text_creator_lines = [
+            f"Ура! Игрок {new_player_contact} принял приглашение в матч #{game_id} ✅",
+        ]
+        if occupied >= total:
+            text_creator_lines.append(
+                f"Теперь ваш матч полностью укомплектован: {occupied} из {total} участников."
+            )
+        else:
+            text_creator_lines.append(
+                f"Сейчас в матче {occupied} из {total} участников."
+            )
+
+        await bot.send_message(creator_id, "\n".join(text_creator_lines))
+    except Exception as e:
+        logger.exception("Failed to notify organizer about accepted invitation: %s", e)
+
+    # 2) Сообщение принятому участнику
+    try:
+        contacts_for_player = build_contacts_for(invited_id)
+        await bot.send_message(
+            invited_id,
+            f"Ура! Ты принял приглашение и участвуешь в матче #{game_id} ✅\n\n"
+            f"Вот контакты других участников матча:\n{contacts_for_player}",
+        )
+    except Exception as e:
+        logger.exception("Failed to notify invited user about accepted invitation: %s", e)
+
+    # 3) Сообщения остальным участникам матча
+    try:
+        new_player_user = users_by_id.get(invited_id)
+        new_player_contact = format_contact(new_player_user)
+
+        for pid in participant_ids:
+            if pid == invited_id or pid == creator_id:
+                continue
+            contacts_for_other = build_contacts_for(pid)
+            await bot.send_message(
+                pid,
+                f"К вашему матчу #{game_id} присоединился новый участник {new_player_contact} ✅\n\n"
+                f"Актуальный список участников (которым вы можете написать в Telegram):\n{contacts_for_other}",
+            )
+    except Exception as e:
+        logger.exception("Failed to notify existing participants about new invited one: %s", e)
+
+    await callback.answer("Участие подтверждено ✅", show_alert=False)
 
     await callback.answer()
 # ---------- Просмотр участников матча ----------
