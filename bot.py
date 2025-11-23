@@ -2910,7 +2910,7 @@ async def newgame_comment(message: Message, state: FSMContext):
         f"Комментарий: {comment_text}"
     )
 
-    await message.answer(txt, parse_mode="HTML")
+    await message.answer(txt, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 # -----------------------------------------
 # Просмотр матчей: /games
@@ -4108,4 +4108,3 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
