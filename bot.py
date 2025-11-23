@@ -3349,39 +3349,69 @@ async def _send_created_games_list(message: Message, user_id: int, status: Optio
             f"Счёт: {score_text}"
         )
 
-        if status == "scheduled":
+        # Кнопки зависят от фактического статуса матча, а не от фильтра,
+        # через который пользователь открыл список.
+        if g["status"] == "scheduled":
+            # Запланированный матч — можно смотреть отклики, участников и отменять.
+            # Кнопка «Пригласить участников» показывается только если матч ещё не укомплектован.
+            buttons = [
+                [
+                    InlineKeyboardButton(
+                        text="👀 Просмотреть отклики",
+                        callback_data=f"view_apps:{g['id']}",
+                    )
+                ]
+            ]
+
+            # Добавляем кнопку приглашения только если есть свободные места
+            if occupied < total:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="📨 Пригласить участников",
+                            callback_data=f"invite_players:{g['id']}:0",
+                        )
+                    ]
+                )
+
+            # Кнопка просмотра участников
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="👥 Просмотреть участников",
+                        callback_data=f"view_participants:{g['id']}",
+                    )
+                ]
+            )
+
+            # Кнопка отмены матча
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отменить матч",
+                        callback_data=f"cancel_game:{g['id']}",
+                    )
+                ]
+            )
+
+            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+            await message.answer(txt, parse_mode="HTML", reply_markup=kb)
+        elif g["status"] == "finished" and not g["score"]:
+            # Завершённый матч без счёта — предлагаем внести счёт
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="👀 Откликнувшиеся",
-                            callback_data=f"view_apps:{g['id']}",
+                            text="Внести счёт",
+                            callback_data=f"set_score:{g['id']}",
                         )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="❌ Отменить матч",
-                            callback_data=f"cancel_game:{g['id']}",
-                        )
-                    ],
+                    ]
                 ]
             )
             await message.answer(txt, parse_mode="HTML", reply_markup=kb)
-        else:  # finished
-            if not g["score"]:
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="Внести счёт",
-                                callback_data=f"set_score:{g['id']}",
-                            )
-                        ]
-                    ]
-                )
-                await message.answer(txt, parse_mode="HTML", reply_markup=kb)
-            else:
-                await message.answer(txt, parse_mode="HTML")
+        else:
+            # Для остальных случаев (есть счёт, матч отменён и т.п.) — без доп. кнопок
+            await message.answer(txt, parse_mode="HTML")
 
 
 async def _send_my_participating_games(message: Message, user_id: int):
@@ -3994,6 +4024,233 @@ async def view_apps_callback(callback: CallbackQuery):
 
     await callback.answer()
 
+
+
+
+
+# ---------- Приглашение участников на матч ----------
+
+
+@dp.callback_query(F.data.startswith("invite_players:"))
+async def invite_players_callback(callback: CallbackQuery):
+    """
+    Показ карточек игроков для приглашения на матч.
+
+    Работает постранично: по 10 игроков за раз.
+    callback_data:
+        invite_players:<game_id>:<offset>
+    """
+    await update_username_only(callback.from_user.id, callback.from_user.username)
+    data = callback.data or ""
+    parts = data.split(":")
+    try:
+        # invite_players:<game_id>[:<offset>]
+        if len(parts) == 2:
+            _, game_id_str = parts
+            offset = 0
+        else:
+            _, game_id_str, offset_str = parts[:3]
+            offset = int(offset_str or 0)
+        game_id = int(game_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID матча.", show_alert=False)
+        return
+
+    # Получаем матч и проверяем, что пользователь — его организатор
+    game = await get_game_by_id(game_id)
+    if not game:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    if game["creator_id"] != callback.from_user.id:
+        await callback.answer("Ты не организатор этого матча.", show_alert=True)
+        return
+
+    if game["status"] != "scheduled":
+        await callback.answer("Приглашать игроков можно только на предстоящие матчи.", show_alert=True)
+        return
+
+    # Если матч уже укомплектован — приглашать некого
+    occupied, total = await get_game_occupancy(game_id)
+    if occupied >= total:
+        await callback.answer("Матч уже укомплектован — свободных мест нет.", show_alert=True)
+        return
+
+    # Список уже участвующих (организатор, если играет сам, + принятые заявки),
+    # чтобы не предлагать их повторно.
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+
+    rating_min = game["rating_min"]
+    rating_max = game["rating_max"]
+
+    PAGE_SIZE = 10
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        params = []
+        sql = "SELECT * FROM users WHERE 1=1"
+
+        if participant_ids:
+            placeholders = ",".join(["?"] * len(participant_ids))
+            sql += f" AND telegram_id NOT IN ({placeholders})"
+            params.extend(participant_ids)
+
+        # Фильтр по рейтингу, если у матча заданы границы
+        if rating_min is not None:
+            sql += " AND ntrp >= ?"
+            params.append(rating_min)
+        if rating_max is not None:
+            sql += " AND ntrp <= ?"
+            params.append(rating_max)
+
+        # Берём на одного больше, чтобы понять, есть ли следующая страница
+        sql += " ORDER BY telegram_id DESC LIMIT ? OFFSET ?"
+        params.extend([PAGE_SIZE + 1, offset])
+
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+    if not rows:
+        if offset == 0:
+            await callback.message.reply("Пока нет подходящих игроков для приглашения.")
+        else:
+            await callback.message.reply("Больше игроков для приглашения не найдено.")
+        await callback.answer()
+        return
+
+    has_more = len(rows) > PAGE_SIZE
+    if has_more:
+        rows = rows[:PAGE_SIZE]
+
+    # Отправляем карточки игроков
+    for r in rows:
+        name = r["name"] or "—"
+        gender = r["gender"] or "—"
+        city = r["city"] or "—"
+        ntrp = r["ntrp"]
+        ntrp_text = f"{ntrp:.2f}" if ntrp is not None else "—"
+        about = r["about"] or "—"
+        username = r["username"]
+        birth_date_str = r["birth_date"]
+        age = calculate_age_from_str(birth_date_str)
+        age_text = f"{age} лет" if age is not None else "—"
+        photo_file_id = r["photo_file_id"]
+
+        txt = (
+            f"📇 <b>Игрок для приглашения</b>\n\n"
+            f"Имя: {name}\n"
+            f"Пол: {gender}\n"
+            f"Город: {city}\n"
+            f"Рейтинг: {ntrp_text}\n"
+            f"Возраст: {age_text}\n"
+            f"О себе: {about}"
+        )
+
+        if username:
+            txt += f"\nСвязаться: @{username}"
+
+        if photo_file_id:
+            await bot.send_photo(
+                callback.from_user.id,
+                photo=photo_file_id,
+                caption=txt,
+                parse_mode="HTML",
+            )
+        else:
+            await bot.send_message(
+                callback.from_user.id,
+                txt,
+                parse_mode="HTML",
+            )
+
+    # Кнопка «Показать ещё», если есть следующая страница
+    if has_more:
+        next_offset = offset + PAGE_SIZE
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Показать ещё",
+                        callback_data=f"invite_players:{game_id}:{next_offset}",
+                    )
+                ]
+            ]
+        )
+        await callback.message.reply("Показать ещё игроков для приглашения?", reply_markup=kb)
+
+    await callback.answer()
+# ---------- Просмотр участников матча ----------
+
+@dp.callback_query(F.data.startswith("view_participants:"))
+async def view_participants_callback(callback: CallbackQuery):
+    await update_username_only(callback.from_user.id, callback.from_user.username)
+    data = callback.data or ""
+    try:
+        _, game_id_str = data.split(":", 1)
+        game_id = int(game_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID матча.", show_alert=False)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Проверяем, что матч существует и кто его создал
+        cursor = await db.execute(
+            "SELECT creator_id FROM games WHERE id = ?;",
+            (game_id,),
+        )
+        game_row = await cursor.fetchone()
+        await cursor.close()
+
+        if not game_row:
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+
+        if game_row["creator_id"] != callback.from_user.id:
+            await callback.answer("Ты не организатор этого матча.", show_alert=True)
+            return
+
+    # Получаем список участников (принятые заявки + организатор, если он играет сам)
+    participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+
+    if not participant_ids:
+        await callback.message.reply("Пока нет участников с принятыми заявками.")
+        await callback.answer()
+        return
+
+    lines = []
+    for pid in participant_ids:
+        user_row = await get_user(pid)
+        if not user_row:
+            continue
+
+        name = user_row["name"] or "—"
+        ntrp = user_row["ntrp"]
+        ntrp_text = f"{ntrp:.2f}" if ntrp is not None else "—"
+        username = user_row["username"]
+        if username:
+            mention = f"@{username}"
+        else:
+            mention = ""
+
+        line = f"• {name} (рейтинг: {ntrp_text})"
+        if mention:
+            line += f" {mention}"
+        lines.append(line)
+
+    if not lines:
+        await callback.message.reply("Не удалось получить информацию об участниках.")
+        await callback.answer()
+        return
+
+    text = "👥 Участники матча #{game_id}:\n\n" + "\n".join(lines)
+    text = text.replace("{game_id}", str(game_id))
+
+    await callback.message.reply(text)
+    await callback.answer()
 # ---------- Ввод счёта для завершённого матча ----------
 
 @dp.callback_query(F.data.startswith("set_score:"))
