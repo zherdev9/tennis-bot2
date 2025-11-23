@@ -4523,10 +4523,9 @@ async def view_participants_callback(callback: CallbackQuery):
         await callback.answer("Некорректный ID матча.", show_alert=False)
         return
 
+    # Проверяем, что матч существует и что этот пользователь — организатор
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-
-        # Проверяем, что матч существует и кто его создал
         cursor = await db.execute(
             "SELECT creator_id FROM games WHERE id = ?;",
             (game_id,),
@@ -4534,13 +4533,13 @@ async def view_participants_callback(callback: CallbackQuery):
         game_row = await cursor.fetchone()
         await cursor.close()
 
-        if not game_row:
-            await callback.answer("Матч не найден.", show_alert=True)
-            return
+    if not game_row:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
 
-        if game_row["creator_id"] != callback.from_user.id:
-            await callback.answer("Ты не организатор этого матча.", show_alert=True)
-            return
+    if game_row["creator_id"] != callback.from_user.id:
+        await callback.answer("Ты не организатор этого матча.", show_alert=True)
+        return
 
     # Получаем список участников (принятые заявки + организатор, если он играет сам)
     participant_ids = await get_game_participant_ids(game_id, include_creator=True)
@@ -4550,35 +4549,51 @@ async def view_participants_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    lines = []
+    # Для каждого участника показываем полноценную карточку профиля
     for pid in participant_ids:
         user_row = await get_user(pid)
         if not user_row:
             continue
 
         name = user_row["name"] or "—"
+        gender = user_row["gender"] or "—"
+        city = user_row["city"] or "—"
         ntrp = user_row["ntrp"]
         ntrp_text = f"{ntrp:.2f}" if ntrp is not None else "—"
+        about = user_row["about"] or "—"
+        birth_date_str = user_row["birth_date"]
+        age = calculate_age_from_str(birth_date_str) if birth_date_str else None
+        age_text = f"{age} лет" if age is not None else "—"
+        photo_file_id = user_row["photo_file_id"]
         username = user_row["username"]
+
+        txt = (
+            f"📇 <b>Участник матча #{game_id}</b>\n\n"
+            f"Имя: {name}\n"
+            f"Пол: {gender}\n"
+            f"Город: {city}\n"
+            f"Рейтинг: {ntrp_text}\n"
+            f"Возраст: {age_text}\n"
+            f"О себе: {about}"
+        )
+
         if username:
-            mention = f"@{username}"
+            txt += f"\nСвязаться: @{username}"
+
+        if photo_file_id:
+            await bot.send_photo(
+                callback.from_user.id,
+                photo=photo_file_id,
+                caption=txt,
+                parse_mode="HTML",
+            )
         else:
-            mention = ""
+            await bot.send_message(
+                callback.from_user.id,
+                txt,
+                parse_mode="HTML",
+            )
 
-        line = f"• {name} (рейтинг: {ntrp_text})"
-        if mention:
-            line += f" {mention}"
-        lines.append(line)
-
-    if not lines:
-        await callback.message.reply("Не удалось получить информацию об участниках.")
-        await callback.answer()
-        return
-
-    text = "👥 Участники матча #{game_id}:\n\n" + "\n".join(lines)
-    text = text.replace("{game_id}", str(game_id))
-
-    await callback.message.reply(text)
     await callback.answer()
 # ---------- Ввод счёта для завершённого матча ----------
 
