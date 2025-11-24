@@ -3182,7 +3182,13 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
                         text="Подать заявку на матч",
                         callback_data=f"apply_game:{g['id']}",
                     )
-                ]
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="👥 Просмотреть участников",
+                        callback_data=f"view_participants:{g['id']}",
+                    )
+                ],
             ]
         )
 
@@ -3405,13 +3411,29 @@ async def _send_created_games_list(message: Message, user_id: int, status: Optio
                             text="Внести счёт",
                             callback_data=f"set_score:{g['id']}",
                         )
-                    ]
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="👥 Просмотреть участников",
+                            callback_data=f"view_participants:{g['id']}",
+                        )
+                    ],
                 ]
             )
             await message.answer(txt, parse_mode="HTML", reply_markup=kb)
         else:
-            # Для остальных случаев (есть счёт, матч отменён и т.п.) — без доп. кнопок
-            await message.answer(txt, parse_mode="HTML")
+            # Для остальных случаев (есть счёт, матч отменён и т.п.) — только просмотр участников
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="👥 Просмотреть участников",
+                            callback_data=f"view_participants:{g['id']}",
+                        )
+                    ]
+                ]
+            )
+            await message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
 
 async def _send_my_participating_games(message: Message, user_id: int):
@@ -3505,7 +3527,18 @@ async def _send_my_participating_games(message: Message, user_id: int):
             f"Счёт: {score_text}"
         )
 
-        await message.answer(txt, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="👥 Просмотреть участников",
+                        callback_data=f"view_participants:{g['id']}",
+                    )
+                ]
+            ]
+        )
+
+        await message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(F.text == "/mygames")
