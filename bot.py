@@ -4194,47 +4194,221 @@ async def invite_players_callback(callback: CallbackQuery):
         await callback.message.reply("Показать ещё игроков для приглашения?", reply_markup=kb)
 
 
+
 @dp.callback_query(F.data.startswith("send_invite:"))
 async def send_invite_callback(callback: CallbackQuery):
-    """Обработка нажатия кнопки "Пригласить в матч" под карточкой игрока."""
+    """
+    Обработка нажатия кнопки «Пригласить в матч» под карточкой игрока.
+
+    Ожидаем формат callback_data:
+        send_invite:<game_id>:<invited_user_id>
+    """
     await update_username_only(callback.from_user.id, callback.from_user.username)
     data = callback.data or ""
+
     try:
-        await bot.send_message(invited_id, invite_text, reply_markup=kb)
-    except Exception as e:
-        logger.exception("Failed to send invitation: %s", e)
-        await callback.answer("Не удалось отправить приглашение этому игроку 😔", show_alert=True)
-        return
-
-    # Уведомляем организатора отдельным сообщением
-    invited_display = "игроку"
-    if invited_user:
+        # ---------------- Разбор callback_data ----------------
         try:
+            _, game_id_str, invited_id_str = data.split(":", 2)
+            game_id = int(game_id_str)
+            invited_id = int(invited_id_str)
+        except Exception:
+            # Если что-то не так с данными — даём понятный ответ организатору
+            await callback.message.answer(
+                "❗ Не удалось обработать приглашение: некорректные данные.
+"
+                "Попробуй ещё раз из списка игроков."
+            )
+            try:
+                await callback.answer("Некорректные данные приглашения.", show_alert=False)
+            except Exception:
+                pass
+            return
+
+        # ---------------- Проверки матча и игрока ----------------
+        game = await get_game_by_id(game_id)
+        if not game:
+            await callback.message.answer("❗ Матч не найден. Возможно, он был удалён или изменён.")
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+
+        # Нельзя пригласить самого себя
+        if invited_id == callback.from_user.id:
+            await callback.answer("Нельзя пригласить самого себя 🙂", show_alert=True)
+            return
+
+        # Уже участник?
+        participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+        if invited_id in participant_ids:
+            await callback.answer("Этот игрок уже участвует в матче.", show_alert=True)
+            return
+
+        # Достаём данные приглашаемого и организатора
+        invited_user = await get_user(invited_id)
+        creator_id = game["creator_id"]
+        creator_user = await get_user(creator_id)
+
+        def _format_contact(u) -> str:
+            if not u:
+                return "Игрок"
+            username = u["username"]
+            name = u["name"] or "Игрок"
+            if username:
+                return f"{name} (@{username})"
+            return name
+
+        creator_line = _format_contact(creator_user)
+
+        # ---------------- Формируем карточку матча ----------------
+        if game["rating_min"] is not None and game["rating_max"] is not None:
+            rating_text = f"{game['rating_min']:.2f}-{game['rating_max']:.2f}"
+        else:
+            rating_text = "Без ограничений"
+
+        booking_text = "забронирован" if game["is_court_booked"] else "не забронирован"
+        comment_text = game["comment"] if game["comment"] else "—"
+        addr = game["court_address"] or "Адрес не указан"
+        occupied, total = await get_game_occupancy(game_id)
+        score_text = game["score"] or "—"
+
+        payment_type = game["payment_type"]
+        if payment_type == "split":
+            payment_text = "делим поровну между всеми игроками"
+        elif payment_type == "creator":
+            payment_text = "организатор оплачивает корт"
+        elif payment_type == "discuss":
+            payment_text = "обсудим оплату в чате"
+        else:
+            payment_text = "не указано"
+
+        duration_minutes = game["duration_minutes"]
+        if duration_minutes:
+            hours = duration_minutes // 60
+            mins = duration_minutes % 60
+            if hours and mins:
+                duration_text = f"{hours} ч {mins} мин"
+            elif hours:
+                duration_text = f"{hours} ч"
+            else:
+                duration_text = f"{mins} мин"
+        else:
+            duration_text = None
+
+        if game["match_end_time"]:
+            if duration_text:
+                time_line = f"Время: {game['match_time']}–{game['match_end_time']} ({duration_text})\n"
+            else:
+                time_line = f"Время: {game['match_time']}–{game['match_end_time']}\n"
+        else:
+            if duration_text:
+                time_line = f"Время: {game['match_time']} ({duration_text})\n"
+            else:
+                time_line = f"Время: {game['match_time']}\n"
+
+        invite_text = (
+            f"📩 Тебя пригласили в матч #{game_id}!\n\n"
+            f"🎾 <b>Матч #{game_id}</b>\n\n"
+            f"Организатор: {creator_line}\n"
+            f"Тип: {game['game_type']}\n"
+            f"Дата: {game['match_date']}\n"
+            f"{time_line}"
+            f"Корт: {game['court_short_name']} — <i>📍 {addr}</i>\n"
+            f"Игроки: {occupied} из {total}\n"
+            f"Ограничение по рейтингу: {rating_text}\n"
+            f"Бронь корта: {booking_text}\n"
+            f"Оплата: {payment_text}\n"
+            f"Комментарий: {comment_text}\n"
+            f"Счёт: {score_text}"
+        )
+
+        # ---------------- Клавиатура для приглашённого ----------------
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Принять",
+                        callback_data=f"invite_decision:{game_id}:accept",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отказаться",
+                        callback_data=f"invite_decision:{game_id}:reject",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="👥 Посмотреть других участников",
+                        callback_data=f"view_participants:{game_id}",
+                    )
+                ],
+            ]
+        )
+
+        # ---------------- Отправка приглашения приглашённому ----------------
+        try:
+            await bot.send_message(
+                invited_id,
+                invite_text,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.exception("Failed to send invitation: %s", e)
+            # Явно сообщаем организатору в чат, что не удалось отправить
+            await callback.message.answer(
+                "⚠️ Не удалось отправить приглашение этому игроку.
+"
+                "Чаще всего это происходит, если он ещё не писал боту или заблокировал его."
+            )
+            try:
+                await callback.answer("Не удалось отправить приглашение этому игроку 😔", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        # ---------------- Уведомляем организатора ----------------
+        invited_display = "игроку"
+        if invited_user:
             name = invited_user["name"]
-        except Exception:
-            name = None
-        try:
             username = invited_user["username"]
+            parts = []
+            if name:
+                parts.append(name)
+            if username:
+                parts.append(f"@{username}")
+            if parts:
+                invited_display = " ".join(parts)
+
+        notify_text = f"✅ Приглашение {invited_display} на матч #{game_id} отправлено."
+
+        # ЛС организатору
+        await bot.send_message(callback.from_user.id, notify_text)
+
+        # И по возможности — ответ в текущий чат (если это уместно)
+        try:
+            await callback.message.answer(notify_text)
         except Exception:
-            username = None
+            pass
 
-        parts = []
-        if name:
-            parts.append(name)
-        if username:
-            parts.append(f"@{username}")
-        if parts:
-            invited_display = " ".join(parts)
+        try:
+            await callback.answer("Приглашение отправлено игроку ✅", show_alert=False)
+        except Exception:
+            pass
 
-    await bot.send_message(
-        callback.from_user.id,
-        f"✅ Приглашение {invited_display} на матч #{game_id} отправлено.",
-    )
-
-    await callback.answer("Приглашение отправлено игроку ✅", show_alert=False)
-
-
-
+    except Exception as e:
+        # Любая непредвиденная ошибка — лог и понятное сообщение организатору
+        logger.exception("Unexpected error in send_invite_callback: %s", e)
+        try:
+            await callback.message.answer(
+                "❗ Произошла непредвиденная ошибка при отправке приглашения.
+"
+                "Попробуй ещё раз чуть позже."
+            )
+        except Exception:
+            pass
+        try:
+            await callback.answer("Ошибка при отправке приглашения 😔", show_alert=True)
+        except Exception:
+            pass
 @dp.callback_query(F.data.startswith("invite_decision:"))
 async def invite_decision_callback(callback: CallbackQuery):
     """Обработка решения игрока по приглашению (принять/отклонить)."""
