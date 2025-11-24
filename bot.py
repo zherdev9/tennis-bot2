@@ -4357,8 +4357,6 @@ async def send_invite_callback(callback: CallbackQuery):
         parts = []
         if name:
             parts.append(name)
-        if username:
-            parts.append(f"@{username}")
         if parts:
             invited_display = " ".join(parts)
 
