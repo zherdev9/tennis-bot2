@@ -3175,22 +3175,49 @@ async def _send_games_page(message: Message, state: FSMContext, initial: bool = 
             f"Комментарий: {comment_text}"
         )
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
+        is_creator = g["creator_id"] == message.from_user.id
+
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    text="👥 Просмотреть участников",
+                    callback_data=f"view_participants:{g['id']}",
+                )
+            ]
+        ]
+
+        if is_creator:
+            # Мой предстоящий матч: можно приглашать и отменять
+            if occupied < total:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="📨 Пригласить участников",
+                            callback_data=f"invite_players:{g['id']}:0",
+                        )
+                    ]
+                )
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отменить матч",
+                        callback_data=f"cancel_game:{g['id']}",
+                    )
+                ]
+            )
+        else:
+            # Чужой предстоящий матч: можно подать заявку
+            buttons.append(
                 [
                     InlineKeyboardButton(
                         text="Подать заявку на матч",
                         callback_data=f"apply_game:{g['id']}",
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="👥 Просмотреть участников",
-                        callback_data=f"view_participants:{g['id']}",
-                    )
-                ],
-            ]
-        )
+                ]
+            )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         await message.answer(txt, parse_mode="HTML", reply_markup=kb)
 
@@ -3411,29 +3438,13 @@ async def _send_created_games_list(message: Message, user_id: int, status: Optio
                             text="Внести счёт",
                             callback_data=f"set_score:{g['id']}",
                         )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="👥 Просмотреть участников",
-                            callback_data=f"view_participants:{g['id']}",
-                        )
-                    ],
-                ]
-            )
-            await message.answer(txt, parse_mode="HTML", reply_markup=kb)
-        else:
-            # Для остальных случаев (есть счёт, матч отменён и т.п.) — только просмотр участников
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="👥 Просмотреть участников",
-                            callback_data=f"view_participants:{g['id']}",
-                        )
                     ]
                 ]
             )
             await message.answer(txt, parse_mode="HTML", reply_markup=kb)
+        else:
+            # Для остальных случаев (есть счёт, матч отменён и т.п.) — без доп. кнопок
+            await message.answer(txt, parse_mode="HTML")
 
 
 async def _send_my_participating_games(message: Message, user_id: int):
