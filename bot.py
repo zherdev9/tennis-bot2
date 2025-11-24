@@ -4192,9 +4192,6 @@ async def invite_players_callback(callback: CallbackQuery):
             f"О себе: {about}"
         )
 
-        if username:
-            txt += f"\nСвязаться: @{username}"
-
         kb_player = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -4657,6 +4654,7 @@ async def view_participants_callback(callback: CallbackQuery):
 
     # Получаем список участников (принятые заявки + организатор, если он играет сам)
     participant_ids = await get_game_participant_ids(game_id, include_creator=True)
+    viewer_in_game = callback.from_user.id in participant_ids
 
     if not participant_ids:
         await callback.message.reply("Пока нет участников с принятыми заявками.")
@@ -4691,7 +4689,7 @@ async def view_participants_callback(callback: CallbackQuery):
             f"О себе: {about}"
         )
 
-        if username:
+        if viewer_in_game and username:
             txt += f"\nСвязаться: @{username}"
 
         if photo_file_id:
@@ -4812,5 +4810,4 @@ async def main():
     )
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == "__main__"
